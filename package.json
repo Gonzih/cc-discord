@@ -1,0 +1,47 @@
+{
+  "name": "@gonzih/cc-discord",
+  "version": "0.1.0",
+  "description": "Claude Code Discord bot — chat with Claude Code via Discord",
+  "type": "module",
+  "bin": {
+    "cc-discord": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "start": "node dist/index.js",
+    "dev": "node --loader ts-node/esm src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "files": [
+    "dist/"
+  ],
+  "dependencies": {
+    "@gonzih/cc-wire": "^0.1.4",
+    "discord.js": "^14.0.0",
+    "ioredis": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^4.1.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Gonzih/cc-discord.git"
+  },
+  "homepage": "https://github.com/Gonzih/cc-discord",
+  "bugs": {
+    "url": "https://github.com/Gonzih/cc-discord/issues"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "discord",
+    "bot",
+    "ai"
+  ],
+  "license": "MIT"
+}
