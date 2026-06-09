@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.feral.cc-discord</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/opt/node@22/bin/npx</string>
+    <string>--prefer-online</string>
+    <string>@gonzih/cc-discord@latest</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DISCORD_BOT_TOKEN</key>
+    <string>FILL_IN_TUESDAY</string>
+    <key>DISCORD_GUILD_IDS</key>
+    <string>FILL_IN_TUESDAY</string>
+    <key>DISCORD_ALLOWED_USER_IDS</key>
+    <string>FILL_IN_TUESDAY</string>
+    <key>DISCORD_NOTIFY_CHANNEL_ID</key>
+    <string>FILL_IN_TUESDAY</string>
+    <key>CLAUDE_CODE_OAUTH_TOKEN</key>
+    <string>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</string>
+    <key>CC_AGENT_NAMESPACE</key>
+    <string>money-brain</string>
+    <key>CWD</key>
+    <string>/Users/feral/money-brain</string>
+    <key>DEFAULT_GITHUB_ORG</key>
+    <string>gonzih</string>
+    <key>REDIS_URL</key>
+    <string>redis://localhost:6379</string>
+    <key>PATH</key>
+    <string>/Users/feral/.npm-global/bin:/opt/homebrew/bin:/opt/homebrew/opt/node@22/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>npm_config_cache</key>
+    <string>/Users/feral/.npm-cache-money-brain</string>
+  </dict>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/feral/Library/Logs/cc-discord.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/feral/Library/Logs/cc-discord.error.log</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/feral/money-brain</string>
+</dict>
+</plist>
