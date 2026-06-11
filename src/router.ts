@@ -1,5 +1,5 @@
 /**
- * Hashtag meta-agent routing.
+ * Routing helpers: hashtag meta-agent routing and channel-creation intent detection.
  *
  * Parses #tag or #org/repo tokens from Telegram messages and routes them to
  * the appropriate cc-agent meta-agent instead of the local Claude session.
@@ -197,6 +197,23 @@ export async function ensureMetaAgent(
   }
 
   throw new Error(`Meta-agent for ${namespace} did not become ready within ${timeoutMs}ms`);
+}
+
+/**
+ * Detect a natural-language channel-creation request.
+ * Matches:
+ *   "channel for https://github.com/org/repo"
+ *   "create channel for https://github.com/org/repo"
+ *   "add channel for https://github.com/org/repo"
+ *
+ * Returns { namespace, repoUrl } or null.
+ */
+export function parseChannelCreateIntent(text: string): { namespace: string; repoUrl: string } | null {
+  const match = text.match(/(?:create\s+|add\s+)?channel\s+for\s+(https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+))/i);
+  if (!match) return null;
+  const repoUrl = match[1];
+  const namespace = match[3];
+  return { namespace, repoUrl };
 }
 
 /**

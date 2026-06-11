@@ -32,7 +32,7 @@ import { formatForDiscord, splitLongMessage, stripAnsi } from "./formatter.js";
 import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./tokens.js";
 import { writeChatLog, type ChatMessage } from "./notifier.js";
 import { CronManager } from "./cron.js";
-import { parseRoutingTag, ensureMetaAgent, routeToMetaAgent } from "./router.js";
+import { parseRoutingTag, parseChannelCreateIntent, ensureMetaAgent, routeToMetaAgent } from "./router.js";
 import { metaAgentStatusKey } from "@gonzih/cc-wire";
 
 type SendableChannel = TextChannel | DMChannel | NewsChannel | ThreadChannel | VoiceChannel;
@@ -215,6 +215,9 @@ export class CcDiscordBot {
   /** Reverse-lookup: find the channelId string for a cron-stored integer */
   private snowflakeMap = new Map<number, string>();
 
+  /** Channels created by the bot for a meta-agent namespace → skip local Claude session */
+  private channelNamespaceMap = new Map<string, { namespace: string; repoUrl: string }>();
+
   private storeSnowflake(channelId: string): number {
     const n = snowflakeToInt(channelId);
     this.snowflakeMap.set(n, channelId);
@@ -344,6 +347,28 @@ export class CcDiscordBot {
     // Strip @mention
     text = text.replace(/<@!?\d+>/g, "").trim();
     if (!text) return;
+
+    // Natural-language channel creation: "channel for https://github.com/org/repo"
+    if (this.redis) {
+      const intent = parseChannelCreateIntent(text);
+      if (intent) {
+        await this.createChannelForRepo(msg, intent.namespace, intent.repoUrl);
+        return;
+      }
+    }
+
+    // Channel registered via createChannelForRepo or /channel — route directly to its meta-agent
+    const mappedNs = this.channelNamespaceMap.get(effectiveChannelId);
+    if (mappedNs && this.redis) {
+      this.writeChatMessage("user", "discord", text, effectiveChannelId);
+      this.opts.registerRoutedChannelId?.(mappedNs.namespace, effectiveChannelId);
+      try {
+        await routeToMetaAgent(mappedNs.namespace, text, this.redis);
+      } catch (err) {
+        await (msg.channel as TextChannel).send(`Failed to route to ${mappedNs.namespace}: ${(err as Error).message}`).catch(() => {});
+      }
+      return;
+    }
 
     // #tag / #org/repo routing — delegate to meta-agent
     if (this.redis) {
@@ -571,7 +596,9 @@ export class CcDiscordBot {
     session.flushTimer = null;
     if (!text) return;
 
-    this.writeChatMessage("assistant", "claude", text, channelId);
+    // Use source="discord" so the notifier's pmessage guard (source !== "claude") drops it
+    // and does not re-send this message as a second Discord notification.
+    this.writeChatMessage("assistant", "discord", text, channelId);
     await this.sendToChannel(channel, text);
   }
 
@@ -662,6 +689,12 @@ export class CcDiscordBot {
         .setName("wiki")
         .setDescription("Wiki page info (pass namespace to look up)")
         .addStringOption((opt) => opt.setName("namespace").setDescription("Namespace to look up").setRequired(false)),
+      new SlashCommandBuilder()
+        .setName("channel")
+        .setDescription("Create a Discord channel for a GitHub repo meta-agent")
+        .addStringOption((opt) =>
+          opt.setName("repo").setDescription("GitHub repo URL (e.g. https://github.com/org/repo)").setRequired(true)
+        ),
     ].map((cmd) => cmd.toJSON());
 
     const rest = new REST().setToken(this.opts.discordToken);
@@ -752,6 +785,39 @@ export class CcDiscordBot {
           }
         } catch (err) {
           await interaction.editReply(`Wiki lookup failed: ${(err as Error).message}`);
+        }
+        break;
+      }
+
+      case "channel": {
+        const repoUrl = interaction.options.getString("repo", true);
+        const urlMatch = repoUrl.match(/^https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)/i);
+        if (!urlMatch) {
+          await interaction.reply({ content: "Invalid repo URL. Use: https://github.com/org/repo", ephemeral: true });
+          return;
+        }
+        const namespace = urlMatch[2];
+        const guild = interaction.guild;
+        if (!guild) {
+          await interaction.reply({ content: "Channel creation requires a guild (not available in DMs).", ephemeral: true });
+          return;
+        }
+        await interaction.deferReply();
+        try {
+          const newChannel = await guild.channels.create({ name: namespace, type: ChannelType.GuildText }) as TextChannel;
+          this.channelNamespaceMap.set(newChannel.id, { namespace, repoUrl });
+          this.opts.registerRoutedChannelId?.(namespace, newChannel.id);
+          await interaction.editReply(`Created <#${newChannel.id}> — messages there route to the ${repoUrl} meta-agent`);
+          // Start meta-agent in the background
+          if (this.redis) {
+            ensureMetaAgent(namespace, repoUrl, (toolName, args) => this.callCcAgentTool(toolName, args ?? {}), this.redis)
+              .catch((err: Error) => {
+                console.error(`[bot] /channel ensureMetaAgent(${namespace}) failed:`, err.message);
+                this.sendToChannelById(newChannel.id, `Warning: meta-agent startup failed — ${err.message}`).catch(() => {});
+              });
+          }
+        } catch (err) {
+          await interaction.editReply(`Failed to create channel: ${(err as Error).message}`);
         }
         break;
       }
@@ -866,6 +932,37 @@ export class CcDiscordBot {
         done();
       }
     })();
+  }
+
+  /**
+   * Create a new Discord text channel for `namespace`, register it in channelNamespaceMap,
+   * and start the meta-agent for `repoUrl`. Fire-and-forget after sending the confirmation message.
+   */
+  private async createChannelForRepo(msg: Message, namespace: string, repoUrl: string): Promise<void> {
+    const channel = msg.channel as SendableChannel;
+    const guild = msg.guild;
+    if (!guild) {
+      await (channel as TextChannel).send("Channel creation requires a guild (not available in DMs).").catch(() => {});
+      return;
+    }
+    let newChannel: TextChannel;
+    try {
+      newChannel = await guild.channels.create({ name: namespace, type: ChannelType.GuildText }) as TextChannel;
+    } catch (err) {
+      await (channel as TextChannel).send(`Failed to create channel: ${(err as Error).message}`).catch(() => {});
+      return;
+    }
+    this.channelNamespaceMap.set(newChannel.id, { namespace, repoUrl });
+    this.opts.registerRoutedChannelId?.(namespace, newChannel.id);
+    await (channel as TextChannel).send(`Created <#${newChannel.id}> — messages there route to the ${repoUrl} meta-agent`).catch(() => {});
+    // Start meta-agent in the background after acknowledging the user
+    if (this.redis) {
+      ensureMetaAgent(namespace, repoUrl, (toolName, args) => this.callCcAgentTool(toolName, args ?? {}), this.redis)
+        .catch((err: Error) => {
+          console.error(`[bot] ensureMetaAgent(${namespace}) failed:`, err.message);
+          this.sendToChannelById(newChannel.id, `Warning: meta-agent startup failed — ${err.message}`).catch(() => {});
+        });
+    }
   }
 
   /** Write a message to the Redis chat log. Fire-and-forget. */
