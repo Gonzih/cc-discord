@@ -1,30 +1,24 @@
-# Plan: Per-namespace notifyListKey polling (issue #10)
+# Plan: Include replied-to message content for context resurrection
 
-## Task restatement
-PR #9 already fixed pub/sub subscriptions and routing for routed namespaces.
-The remaining gap: `pollNotifyList` only drains `notifyListKey(primary-namespace)`.
-Notifications published to `notifyListKey("simorgh-mobile-app")` are never picked up.
+## Task
+When a Discord user replies to a message, prepend the original message content
+(truncated to 300 chars) to the text forwarded to Claude so Claude has full context.
 
-## Root cause
-`notifier.ts` creates `const notifyListRedisKey = notifyListKey(namespace)` (primary only)
-and a single `setInterval` that calls `pollNotifyList`, which only polls that one key.
-`registerRoutedChannelId` subscribes to pub/sub for the routed namespace but never
-starts polling its list key.
+## Format
+```
+> [replying to <AuthorUsername>]: <original message content (truncated to 300 chars)>
+<user's actual reply>
+```
 
-## Fix
-1. Extract `pollOneNamespace(ns, targetChannelId)` helper — drains `notifyListKey(ns)`,
-   routes each item to `targetChannelId`. Uses `reverseSnowflakeLookup` / chatId routing
-   only for the primary namespace (routed namespaces always go to their registered channelId).
-2. Extend `pollNotifyList` to poll primary namespace + iterate `routedChannelIds` for all
-   registered routed namespaces.
-3. Single `setInterval` (unchanged) calls `pollNotifyList`.
-4. Remove the now-unused `notifyListRedisKey` constant.
-
-## Tests
-Add a test that verifies `registerRoutedChannelId` causes the poll to drain
-`notifyListKey(ns)` and deliver to the registered Discord channelId.
-Uses Vitest fake timers + lightweight mocks for Redis and bot.
+## Chosen approach: Enrich `text` in `handleMessage` before routing
+After `text` is cleaned of @mentions, check `msg.reference?.messageId`, fetch the
+referenced message, and prepend the reply prefix to `text`. This single insertion
+point naturally covers all downstream paths (meta-agent, local Claude session).
 
 ## Files to touch
-- `src/notifier.ts` — core fix
-- `src/notifier.test.ts` — new tests
+- `src/bot.ts` — add reply context enrichment in `handleMessage`
+
+## Risks
+- `messages.fetch()` may throw if the referenced message is deleted — handled with
+  try/catch (silent skip, proceed with original text)
+- Referenced message author may have no `member` in DMs — fallback to `author.username`

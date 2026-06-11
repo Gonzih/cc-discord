@@ -1,11 +1,8 @@
-# TODO: Per-namespace notifyListKey polling (issue #10)
+# TODO: Include replied-to message content
 
-- [x] Create branch fix/per-namespace-notify-subscribe
-- [ ] notifier.ts: extract pollOneNamespace(ns, targetChannelId) helper
-- [ ] notifier.ts: extend pollNotifyList to iterate routedChannelIds
-- [ ] notifier.ts: remove unused notifyListRedisKey constant
-- [ ] notifier.test.ts: add test for per-namespace list polling
-- [ ] npm test — all tests pass
+- [ ] Create branch feat/reply-context
+- [ ] bot.ts: add reply context enrichment after text cleanup in handleMessage
+- [ ] npm install + npm test — all tests pass
 - [ ] git diff --staged — review every change
 - [ ] git commit + push
 - [ ] npm run build && npm version patch && npm publish --access public
