@@ -17,8 +17,11 @@ import {
   chatOutgoingChannel,
   chatIncomingChannel,
   notifyChannel,
+  notifyListKey,
   metaAgentStatusKey,
   metaInputKey,
+  type NotificationPayload,
+  type Transport,
 } from "@gonzih/cc-wire";
 import { splitLongMessage, stripAnsi } from "./formatter.js";
 import type { CcDiscordBot } from "./bot.js";
@@ -56,18 +59,23 @@ export interface ParsedNotification {
 
 /**
  * Parse a notification payload.
- * Returns the display text plus an optional chatId for per-channel routing.
+ * Returns the display text plus an optional chatId for per-channel routing,
+ * or null when the routing array excludes "discord".
  * Appends a [driver] or [driver:model] badge when present.
  * Appends " cost: $X.XXX" if a numeric cost field is present.
  */
-export function parseNotification(raw: string): ParsedNotification {
+export function parseNotification(raw: string): ParsedNotification | null {
   let text = raw;
   let driver: string | undefined;
   let model: string | undefined;
   let cost: number | undefined;
   let chatId: number | undefined;
   try {
-    const parsed = JSON.parse(raw) as { text?: string; driver?: string; model?: string; cost?: number; chat_id?: number };
+    const parsed = JSON.parse(raw) as NotificationPayload;
+    // routing: absent/empty → all transports; non-empty → only listed transports
+    if (parsed.routing && parsed.routing.length > 0 && !parsed.routing.includes("discord" as Transport)) {
+      return null;
+    }
     if (parsed.text) text = parsed.text;
     driver = parsed.driver;
     model = parsed.model;
@@ -252,8 +260,8 @@ export function startNotifier(
     buf.timer = setTimeout(() => flushMetaAgentBuffer(ns, targetChannelId), META_AGENT_FLUSH_DELAY_MS);
   });
 
-  // Poll the notifyChannel(namespace) LIST every 5 seconds
-  const notifyListKey = notifyChannel(namespace);
+  // Poll the notifyListKey(namespace) LIST every 5 seconds
+  const notifyListRedisKey = notifyListKey(namespace);
   const MAX_PER_CYCLE = 20;
 
   const pollNotifyList = async (): Promise<void> => {
@@ -263,7 +271,7 @@ export function startNotifier(
     const items: string[] = [];
     try {
       for (let i = 0; i < MAX_PER_CYCLE; i++) {
-        const item = await redis.rpop(notifyListKey);
+        const item = await redis.rpop(notifyListRedisKey);
         if (item === null) break;
         items.push(item);
       }
@@ -277,7 +285,7 @@ export function startNotifier(
     let remaining = 0;
     if (items.length === MAX_PER_CYCLE) {
       try {
-        remaining = await redis.llen(notifyListKey);
+        remaining = await redis.llen(notifyListRedisKey);
       } catch (err) {
         log("warn", "notify list llen failed:", (err as Error).message);
       }
@@ -285,6 +293,7 @@ export function startNotifier(
 
     for (const raw of items) {
       const notification = parseNotification(raw);
+      if (notification === null) continue; // routing excludes discord
       const destChannelId = resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup) ?? targetId;
       bot.sendToChannelById(destChannelId, notification.text).catch((err: Error) => {
         log("warn", "notify list send failed:", err.message);
@@ -311,6 +320,7 @@ export function startNotifier(
 
     if (channel === notifyCh) {
       const notification = parseNotification(message);
+      if (notification === null) return; // routing excludes discord
       const targetId = resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup);
       if (targetId != null) {
         bot.sendToChannelById(targetId, notification.text).catch((err: Error) => {

@@ -1,15 +1,16 @@
-# TODO: @gonzih/cc-discord v0.1.3
+# TODO: cc-wire 0.1.6 integration
 
+- [x] Install @gonzih/cc-wire@0.1.6 and verify exports
 - [x] Write PLAN.md and TODO.md
-- [ ] Create branch feat/per-channel-cron-routing
-- [ ] bot.ts: pre-populate snowflakeMap in ClientReady with all cached guild channels
-- [ ] bot.ts: make reverseSnowflakeLookup public
-- [ ] bot.ts: /crons list — show <#channelId> mention per job
-- [ ] notifier.ts: parseNotification returns {text, chatId?}
-- [ ] notifier.ts: notify subscriber uses chatId for routing
-- [ ] notifier.ts: pollNotifyList uses chatId for routing
-- [ ] notifier.test.ts: update tests for new return type
-- [ ] Run tests — must pass
+- [ ] Create branch chore/cc-wire-0.1.6
+- [ ] notifier.ts: import NotificationPayload, Transport, notifyListKey from cc-wire
+- [ ] notifier.ts: replace inline type cast with NotificationPayload in parseNotification()
+- [ ] notifier.ts: add routing filter (return null when discord excluded)
+- [ ] notifier.ts: update parseNotification return type to ParsedNotification | null
+- [ ] notifier.ts: update both callers to handle null
+- [ ] notifier.ts: use notifyListKey(namespace) instead of local notifyListKey variable
+- [ ] notifier.test.ts: add routing filter tests
+- [ ] npm test — must pass
 - [ ] git diff --staged review
 - [ ] git commit + push
 - [ ] npm run build && npm version patch && npm publish --access public

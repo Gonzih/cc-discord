@@ -1,51 +1,36 @@
-# Plan: @gonzih/cc-discord v0.1.3 — per-channel cron routing
+# Plan: Use cc-wire 0.1.6 types throughout cc-discord
 
-## Task
+## Task restatement
+@gonzih/cc-wire@0.1.6 is now installed. Replace all ad-hoc notification
+types/constants in cc-discord with cc-wire imports. Specifically:
+1. Use `NotificationPayload` type where payloads are parsed
+2. Use `Transport` type in the routing filter
+3. Use `notifyListKey` builder for list polling (vs `notifyChannel` for pub/sub)
+4. Add routing filter: skip delivery when `routing` is non-empty and doesn't include "discord"
+5. Remove local type definitions that duplicate cc-wire exports
 
-Route cron completion notifications (`cca:notify:{namespace}`) to the Discord channel that
-created the cron, instead of always sending to `DISCORD_NOTIFY_CHANNEL_ID`.
+## What cc-wire 0.1.6 adds
+- `Transport = "discord" | "telegram"` type
+- `NotificationPayload` = `{ text, chat_id?, routing?: Transport[], driver?, model?, cost? }`
+- `notifyListKey(ns)` — same string as `notifyChannel` but semantically the LIST key
+- `notifyPublishCommand(ns, payload)` — shell command builder (not used by cc-discord)
 
-## Current state
-
-- `CronJob.chatId` is already stored as a 53-bit integer (snowflake-derived).
-- `storeSnowflake(id)` / `reverseSnowflakeLookup(n)` exist on `CcDiscordBot` (both private).
-- The CronManager fire callback already does reverse-lookup → `runCronTask(channelId, ...)`.
-- But `notifier.ts` `pollNotifyList` / `sub.on("message")` ignore `chat_id` in the notification
-  payload and always route to `notifyChannelId ?? getActiveChannelId()`.
-
-## What needs to change
-
-### 1. bot.ts — ClientReady: pre-populate snowflakeMap
-All guild channels visible at login are pre-stored so reverse-lookup works even for channels
-that have never sent a message to the bot.
-
-### 2. bot.ts — make reverseSnowflakeLookup public
-The notifier needs to call it to turn a chatId integer back into a Discord channel ID string.
-
-### 3. notifier.ts — parseNotification returns {text, chatId?}
-Add `chat_id?: number` to the parsed payload type. Return `{ text, chatId }`.
-Callers use `.text` for the message and `.chatId` for routing.
-
-### 4. notifier.ts — notify subscriber & pollNotifyList use chatId
-When `chatId` is non-zero:
-  - call `bot.reverseSnowflakeLookup(chatId)` → channelId
-  - fall back to `notifyChannelId ?? getActiveChannelId()` if lookup fails
-
-### 5. notifier.test.ts — update for new return type
-
-### 6. bot.ts — /crons list: show <#channelId> per job
-Use reverseSnowflakeLookup to add a channel mention next to each listed cron.
+## Key observations
+- `NotificationPayload` includes `driver`, `model`, `cost` — so the inline cast
+  in `parseNotification()` is now a duplicate and should be replaced
+- Local `ChatMessage` has `source: "discord" | ...` (cc-wire has `"telegram"`) — NOT a dup
+- Local `ParsedNotification` is the post-parse output (camelCase `chatId`) — NOT a dup
+- Routing rule: absent/empty → all transports; non-empty → only those listed
 
 ## Files to touch
-- `src/bot.ts`
-- `src/notifier.ts`
-- `src/notifier.test.ts`
-- `package.json`
+- `src/notifier.ts` — main changes
+- `src/notifier.test.ts` — routing filter tests
+- `package.json` — already updated to ^0.1.6
 
-## Risks
-- `readyClient.guilds.cache` may not include all guilds if the cache is lazy — channels
-  added via `guild.channels.cache` at ClientReady is safe for guilds the bot is already in.
-- Notification payloads from cc-agent may use `chat_id` (snake_case) not `chatId` — reading
-  `parsed.chat_id` covers this.
-- Changing parseNotification return type is a breaking change to the exported API — tests
-  and all callers must be updated atomically.
+## Approach
+1. Import `NotificationPayload`, `Transport`, `notifyListKey` from cc-wire
+2. Replace inline type cast in `parseNotification()` with `NotificationPayload`
+3. Add routing filter → return `null` when discord is excluded
+4. Update `parseNotification` return type to `ParsedNotification | null`
+5. Update both callers to skip `null`
+6. Rename the local `notifyListKey` variable (conflicts with imported function)
