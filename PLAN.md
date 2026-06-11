@@ -1,29 +1,24 @@
-# Plan: Full Attachment Handling for cc-discord
+# Plan: Fix Duplicate Notification Delivery
 
 ## Task
-Add complete attachment handling to the Discord bot, matching cc-tg's patterns:
-1. **Images** → fetch as base64 → `session.claude.sendImage()`; for meta-agent channels → save to disk + ATTACHMENTS path
-2. **Documents/files** → download to `.cc-discord/uploads/` → ATTACHMENTS prompt → route to local session or meta-agent
-3. **Audio/voice** → Whisper transcription (already exists) → combine with caption → route to local session or meta-agent; detect `.wav`/`.webm`
+Cron messages appear in both #cron and #money-brain Discord channels. The root cause is in `src/notifier.ts`: the `pmessage` handler for `cca:chat:outgoing:*` falls back to `notifyChannelId` for the primary namespace (money-brain), forwarding meta-agent output to Discord. Primary namespace chat output belongs to Telegram (cc-tg), not Discord.
 
-## Current state
-- `handleVoice` exists: transcribes and sends to local Claude only (no meta-agent, no caption combine)
-- `handleImage` exists: fetches base64, sends to local Claude only (no meta-agent, no chat log write)
-- No document/file handling at all
-- Audio detection missing `.wav`, `.webm`, and `audio/` content-type prefix
+## Fix
+In the `pmessage` handler, remove the fallback for the primary namespace. Only forward to Discord when `ns` is explicitly registered in `routedChannelIds`:
 
-## Approach: Extend existing handlers + new handleDocument
+```typescript
+// Before
+const targetChannelId = ns === namespace
+  ? (routedChannelIds.get(ns) ?? notifyChannelId ?? getActiveChannelId?.())
+  : routedChannelIds.get(ns);
 
-1. **handleMessage**: add `.wav`/`.webm`/`audio/` audio detection; add doc check before text check
-2. **handleVoice**: combine transcript with caption; add meta-agent routing
-3. **handleImage**: add meta-agent routing (save to disk path); add `writeChatMessage`
-4. **handleDocument** (new): download → ATTACHMENTS prompt → meta-agent or local session
+// After
+const targetChannelId = routedChannelIds.get(ns);
+```
 
 ## Files to touch
-- `src/bot.ts` — all changes above
-- `src/bot.test.ts` — new file with tests for attachment handling
+- `src/notifier.ts` — pmessage handler (line ~269)
+- `src/notifier.test.ts` — add test verifying primary namespace chat output is dropped
 
 ## Risks
-- `msg.attachments.first()` returns undefined on empty collection — guard with `if (docAttachment)`
-- `crypto.randomUUID()` already used in bot.ts (safe, Node built-in)
-- `mkdirSync` already imported in bot.ts
+- None — this is a targeted 1-line change. Existing tests cover routed namespace behavior.
