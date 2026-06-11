@@ -6,6 +6,7 @@
 import {
   Client,
   GatewayIntentBits,
+  Guild,
   Message,
   REST,
   Routes,
@@ -131,6 +132,18 @@ async function fetchAsBase64(url: string): Promise<string> {
       res.on("error", reject);
     }).on("error", reject);
   });
+}
+
+/**
+ * Resolve the Discord category ID to use as `parent` when creating new text channels.
+ * Priority: DISCORD_DEFAULT_CATEGORY_ID env var → first category named "Text Channels" → undefined.
+ */
+function resolveCategoryId(guild: Guild): string | undefined {
+  if (process.env.DISCORD_DEFAULT_CATEGORY_ID) return process.env.DISCORD_DEFAULT_CATEGORY_ID;
+  const category = guild.channels.cache.find(
+    (ch) => ch.type === ChannelType.GuildCategory && /text channels/i.test(ch.name),
+  );
+  return category?.id;
 }
 
 export interface DiscordBotOptions {
@@ -756,7 +769,7 @@ export class CcDiscordBot {
         }
         await interaction.deferReply();
         try {
-          const newChannel = await guild.channels.create({ name: namespace, type: ChannelType.GuildText }) as TextChannel;
+          const newChannel = await guild.channels.create({ name: namespace, type: ChannelType.GuildText, parent: resolveCategoryId(guild) }) as TextChannel;
           this.channelNamespaceMap.set(newChannel.id, { namespace, repoUrl });
           this.opts.registerRoutedChannelId?.(namespace, newChannel.id);
           await interaction.editReply(`Created <#${newChannel.id}> — messages there route to the ${repoUrl} meta-agent`);
@@ -903,7 +916,7 @@ export class CcDiscordBot {
     }
     let newChannel: TextChannel;
     try {
-      newChannel = await guild.channels.create({ name: namespace, type: ChannelType.GuildText }) as TextChannel;
+      newChannel = await guild.channels.create({ name: namespace, type: ChannelType.GuildText, parent: resolveCategoryId(guild) }) as TextChannel;
     } catch (err) {
       await (channel as TextChannel).send(`Failed to create channel: ${(err as Error).message}`).catch(() => {});
       return;
