@@ -1,14 +1,9 @@
-# TODO: Full Attachment Handling
+# TODO: Fix Primary Namespace Chat Output Leak
 
-- [ ] Create branch feat/attachment-handling
-- [ ] npm install
-- [ ] Run baseline tests
-- [ ] bot.ts: fix audio detection (add .wav, .webm, audio/ prefix)
-- [ ] bot.ts: update handleVoice (caption combine + meta-agent routing)
-- [ ] bot.ts: update handleImage (meta-agent routing + writeChatMessage)
-- [ ] bot.ts: add handleDocument method
-- [ ] bot.ts: add doc attachment check in handleMessage
-- [ ] src/bot.test.ts: tests for new logic
+- [ ] Create branch fix/primary-namespace-chat-output-leak
+- [x] Run baseline tests (60 passed)
+- [ ] notifier.ts: remove notifyChannelId fallback from pmessage handler for primary namespace
+- [ ] notifier.test.ts: add test — primary namespace pmessage should be dropped, not sent to Discord
 - [ ] npm test — all tests pass
 - [ ] git diff --staged — verify changes
 - [ ] git commit + push

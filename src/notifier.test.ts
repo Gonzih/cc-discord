@@ -141,6 +141,54 @@ function buildMocks() {
   return { mockBot, mockSub, mockRedis, sent, listQueues };
 }
 
+describe("startNotifier — pmessage (cca:chat:outgoing:*)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does NOT forward primary namespace meta-agent output to Discord", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    const msg = JSON.stringify({ source: "claude", content: "cron response" });
+    mockSub.emit("pmessage", "cca:chat:outgoing:*", "cca:chat:outgoing:money-brain", msg);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    // Primary namespace chat output must NOT reach Discord
+    expect(sent).toHaveLength(0);
+  });
+
+  it("forwards routed namespace meta-agent output to the registered Discord channel", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks();
+
+    const handle = startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    handle.registerRoutedChannelId("simorgh", "discord-ch-555");
+
+    const msg = JSON.stringify({ source: "claude", content: "routed response" });
+    mockSub.emit("pmessage", "cca:chat:outgoing:*", "cca:chat:outgoing:simorgh", msg);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(sent).toContainEqual(expect.objectContaining({ channelId: "discord-ch-555" }));
+    expect(sent.every((m) => m.channelId !== "primary-notify-ch")).toBe(true);
+  });
+});
+
 describe("startNotifier — per-namespace list polling", () => {
   afterEach(() => {
     vi.useRealTimers();
