@@ -50,4 +50,29 @@ describe("parseNotification", () => {
     const payload = JSON.stringify({ text: "done", driver: "claude", chat_id: 99 });
     expect(parseNotification(payload)).toEqual({ text: "done\n[claude]", chatId: 99 });
   });
+
+  it("returns null when routing excludes discord", () => {
+    const payload = JSON.stringify({ text: "done", routing: ["telegram"] });
+    expect(parseNotification(payload)).toBeNull();
+  });
+
+  it("delivers when routing includes discord", () => {
+    const payload = JSON.stringify({ text: "done", routing: ["discord"] });
+    expect(parseNotification(payload)).toEqual({ text: "done" });
+  });
+
+  it("delivers when routing includes discord alongside other transports", () => {
+    const payload = JSON.stringify({ text: "done", routing: ["discord", "telegram"] });
+    expect(parseNotification(payload)).toEqual({ text: "done" });
+  });
+
+  it("delivers when routing is absent", () => {
+    const payload = JSON.stringify({ text: "done" });
+    expect(parseNotification(payload)).toEqual({ text: "done" });
+  });
+
+  it("delivers when routing is an empty array", () => {
+    const payload = JSON.stringify({ text: "done", routing: [] });
+    expect(parseNotification(payload)).toEqual({ text: "done" });
+  });
 });
