@@ -37,6 +37,11 @@ import { parseChannelCreateIntent, ensureMetaAgent, routeToMetaAgent } from "./r
 
 type SendableChannel = TextChannel | DMChannel | NewsChannel | ThreadChannel | VoiceChannel;
 
+/** Redis key for persisting a Discord channelId → namespace mapping across restarts. */
+function discordChannelKey(channelId: string): string {
+  return `cca:discord:channel:${channelId}`;
+}
+
 /** Convert a Discord snowflake string to a safe 53-bit integer for CronManager compatibility. */
 function snowflakeToInt(id: string): number {
   // Discord snowflakes are up to 2^63, beyond Number.MAX_SAFE_INTEGER.
@@ -248,6 +253,46 @@ export class CcDiscordBot {
     return this.snowflakeMap.get(n);
   }
 
+  /** Persist a channelId → {namespace, repoUrl} mapping to Redis. */
+  private persistChannelMapping(channelId: string, namespace: string, repoUrl: string): void {
+    if (!this.redis) return;
+    const key = discordChannelKey(channelId);
+    const value = JSON.stringify({ namespace, repoUrl });
+    this.redis.set(key, value).catch((err: Error) => {
+      console.warn(`[bot] persistChannelMapping failed for ${channelId}:`, err.message);
+    });
+  }
+
+  /**
+   * Load persisted channel→namespace mappings from Redis and repopulate
+   * channelNamespaceMap + routedChannelIds. Call once on startup after the notifier is ready.
+   */
+  public async loadChannelMappings(): Promise<void> {
+    if (!this.redis) return;
+    let keys: string[];
+    try {
+      keys = await this.redis.keys("cca:discord:channel:*");
+    } catch (err) {
+      console.warn("[bot] loadChannelMappings keys scan failed:", (err as Error).message);
+      return;
+    }
+    for (const key of keys) {
+      try {
+        const raw = await this.redis.get(key);
+        if (!raw) continue;
+        const { namespace, repoUrl } = JSON.parse(raw) as { namespace: string; repoUrl: string };
+        const channelId = key.slice("cca:discord:channel:".length);
+        if (!this.channelNamespaceMap.has(channelId)) {
+          this.channelNamespaceMap.set(channelId, { namespace, repoUrl });
+          this.opts.registerRoutedChannelId?.(namespace, channelId);
+          console.log(`[bot] restored channel mapping: ${channelId} → ${namespace}`);
+        }
+      } catch (err) {
+        console.warn(`[bot] loadChannelMappings: failed to parse ${key}:`, (err as Error).message);
+      }
+    }
+  }
+
   /** Session key: "channelId" or "channelId:threadId" for threads */
   private sessionKey(channelId: string, threadId?: string): string {
     return threadId ? `${channelId}:${threadId}` : channelId;
@@ -380,7 +425,7 @@ export class CcDiscordBot {
     // Channel registered via createChannelForRepo or /channel — route directly to its meta-agent
     const mappedNs = this.channelNamespaceMap.get(effectiveChannelId);
     if (mappedNs && this.redis) {
-      this.writeChatMessage("user", "discord", text, effectiveChannelId);
+      this.writeChatMessage("user", "discord", text, effectiveChannelId, mappedNs.namespace);
       this.opts.registerRoutedChannelId?.(mappedNs.namespace, effectiveChannelId);
       const username = msg.member?.displayName ?? msg.author.username;
       try {
@@ -778,6 +823,7 @@ export class CcDiscordBot {
           const newChannel = await guild.channels.create({ name: namespace, type: ChannelType.GuildText, parent: resolveCategoryId(guild) }) as TextChannel;
           this.channelNamespaceMap.set(newChannel.id, { namespace, repoUrl });
           this.opts.registerRoutedChannelId?.(namespace, newChannel.id);
+          this.persistChannelMapping(newChannel.id, namespace, repoUrl);
           await interaction.editReply(`Created <#${newChannel.id}> — messages there route to the ${repoUrl} meta-agent`);
           // Start meta-agent in the background
           if (this.redis) {
@@ -929,6 +975,7 @@ export class CcDiscordBot {
     }
     this.channelNamespaceMap.set(newChannel.id, { namespace, repoUrl });
     this.opts.registerRoutedChannelId?.(namespace, newChannel.id);
+    this.persistChannelMapping(newChannel.id, namespace, repoUrl);
     await (channel as TextChannel).send(`Created <#${newChannel.id}> — messages there route to the ${repoUrl} meta-agent`).catch(() => {});
     // Start meta-agent in the background after acknowledging the user
     if (this.redis) {
@@ -940,8 +987,9 @@ export class CcDiscordBot {
     }
   }
 
-  /** Write a message to the Redis chat log. Fire-and-forget. */
-  private writeChatMessage(role: ChatMessage["role"], source: ChatMessage["source"], content: string, channelId: string): void {
+  /** Write a message to the Redis chat log. Fire-and-forget.
+   *  Pass `ns` to write under a specific namespace; defaults to the bot's primary namespace. */
+  private writeChatMessage(role: ChatMessage["role"], source: ChatMessage["source"], content: string, channelId: string, ns?: string): void {
     if (!this.redis) return;
     const msg: ChatMessage = {
       id: crypto.randomUUID(),
@@ -951,7 +999,7 @@ export class CcDiscordBot {
       timestamp: new Date().toISOString(),
       chatId: snowflakeToInt(channelId),
     };
-    writeChatLog(this.redis, this.namespace, msg);
+    writeChatLog(this.redis, ns ?? this.namespace, msg);
   }
 
   /** Returns the last channelId that sent a message. */

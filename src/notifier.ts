@@ -121,7 +121,7 @@ export function writeChatLog(
  * When chatId is set and a reverse-lookup function is available, prefer the originating channel.
  * Falls back to notifyChannelId, then getActiveChannelId.
  */
-function resolveNotifyChannel(
+export function resolveNotifyChannel(
   chatId: number | undefined,
   notifyChannelId: string | null,
   getActiveChannelId?: () => string | undefined,
@@ -139,6 +139,8 @@ export interface NotifierHandle {
    * Register the originating Discord channel ID for a routed namespace.
    * When the meta-agent for `namespace` publishes a response, it will be
    * forwarded to `channelId`.
+   * Also subscribes to notifyChannel(namespace) and chatIncomingChannel(namespace)
+   * so notifications and UI messages for that namespace are received.
    */
   registerRoutedChannelId: (namespace: string, channelId: string) => void;
 }
@@ -165,8 +167,10 @@ export function startNotifier(
   getActiveChannelId?: () => string | undefined,
   reverseSnowflakeLookup?: (n: number) => string | undefined
 ): NotifierHandle {
-  // Per-namespace channelId registry
+  // Per-namespace channelId registry — maps routed namespace → Discord channelId
   const routedChannelIds = new Map<string, string>();
+  // Track which namespaces we've already subscribed to (to avoid duplicate subscribe calls)
+  const subscribedNamespaces = new Set<string>();
 
   const sub = redis.duplicate({
     retryStrategy: (times: number) => {
@@ -184,25 +188,43 @@ export function startNotifier(
     log("info", "subscriber disconnected, will reconnect with backoff");
   });
 
-  // notifyChannel(namespace) — forward job completion notifications to Discord
-  sub.subscribe(notifyChannel(namespace), (err) => {
-    if (err) {
-      log("error", `subscribe ${notifyChannel(namespace)} failed:`, err.message);
-    } else {
-      log("info", `subscribed to ${notifyChannel(namespace)}`);
-    }
-  });
+  // Reverse map: Redis channel string → namespace (for O(1) lookup in message handler)
+  const channelToNamespace = new Map<string, string>();
 
-  // chatIncomingChannel(namespace) — messages from UI
-  sub.subscribe(chatIncomingChannel(namespace), (err) => {
-    if (err) {
-      log("error", `subscribe ${chatIncomingChannel(namespace)} failed:`, err.message);
-    } else {
-      log("info", `subscribed to ${chatIncomingChannel(namespace)}`);
-    }
-  });
+  function subscribeNamespace(ns: string): void {
+    if (subscribedNamespaces.has(ns)) return;
+    subscribedNamespaces.add(ns);
 
-  // chatOutgoingChannel("*") — meta-agent stdout lines
+    const notifyCh = notifyChannel(ns);
+    const incomingCh = chatIncomingChannel(ns);
+    channelToNamespace.set(notifyCh, ns);
+    channelToNamespace.set(incomingCh, ns);
+
+    sub.subscribe(notifyCh, (err) => {
+      if (err) {
+        log("error", `subscribe ${notifyCh} failed:`, err.message);
+      } else {
+        log("info", `subscribed to ${notifyCh}`);
+      }
+    });
+
+    sub.subscribe(incomingCh, (err) => {
+      if (err) {
+        log("error", `subscribe ${incomingCh} failed:`, err.message);
+      } else {
+        log("info", `subscribed to ${incomingCh}`);
+      }
+    });
+  }
+
+  function resolveSubscribedNamespace(channel: string): string | undefined {
+    return channelToNamespace.get(channel);
+  }
+
+  // Subscribe to the primary namespace immediately
+  subscribeNamespace(namespace);
+
+  // chatOutgoingChannel("*") — meta-agent stdout lines for ALL namespaces
   sub.psubscribe(chatOutgoingChannel("*"), (err) => {
     if (err) {
       log("error", `psubscribe ${chatOutgoingChannel("*")} failed:`, err.message);
@@ -244,7 +266,13 @@ export function startNotifier(
     const content = parsed.content;
     if (!content) return;
 
-    const targetChannelId = routedChannelIds.get(ns) ?? notifyChannelId ?? getActiveChannelId?.();
+    // For the primary namespace, fall back to notifyChannelId / getActiveChannelId.
+    // For any other namespace, ONLY use the registered channelId — never fall back to
+    // the primary channel, as that would cause cross-namespace leakage.
+    const targetChannelId = ns === namespace
+      ? (routedChannelIds.get(ns) ?? notifyChannelId ?? getActiveChannelId?.())
+      : routedChannelIds.get(ns);
+
     if (targetChannelId == null) {
       log("warn", `meta-agent output: no channelId for namespace=${ns}, dropping line`);
       return;
@@ -315,22 +343,35 @@ export function startNotifier(
   }, 5_000);
 
   sub.on("message", (channel: string, message: string) => {
-    const notifyCh = notifyChannel(namespace);
-    const incomingCh = chatIncomingChannel(namespace);
+    // Determine which namespace this channel belongs to
+    const ns = resolveSubscribedNamespace(channel);
+    if (!ns) return;
+
+    const isPrimary = ns === namespace;
+    const notifyCh = notifyChannel(ns);
+    const incomingCh = chatIncomingChannel(ns);
 
     if (channel === notifyCh) {
       const notification = parseNotification(message);
       if (notification === null) return; // routing excludes discord
-      const targetId = resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup);
+      let targetId: string | undefined;
+      if (isPrimary) {
+        targetId = resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup);
+      } else {
+        // For routed namespaces, only use the registered channelId — no fallback to primary
+        targetId = notification.chatId != null && reverseSnowflakeLookup
+          ? (reverseSnowflakeLookup(notification.chatId) ?? routedChannelIds.get(ns))
+          : routedChannelIds.get(ns);
+      }
       if (targetId != null) {
         bot.sendToChannelById(targetId, notification.text).catch((err: Error) => {
-          log("warn", "notify send failed:", err.message);
+          log("warn", `notify send failed (ns=${ns}):`, err.message);
         });
         if (forwardNotification) {
           forwardNotification(targetId, notification.text);
         }
       } else {
-        log("warn", "notify: no channelId available, dropping notification");
+        log("warn", `notify: no channelId available for ns=${ns}, dropping notification`);
       }
       return;
     }
@@ -346,12 +387,14 @@ export function startNotifier(
         // raw string message — use as-is
       }
 
-      const targetChannelId = notifyChannelId ?? getActiveChannelId?.();
+      const targetChannelId = isPrimary
+        ? (notifyChannelId ?? getActiveChannelId?.())
+        : routedChannelIds.get(ns);
 
       if (targetChannelId !== undefined) {
         // Echo to Discord so the user sees UI messages
         bot.sendToChannelById(targetChannelId, `[from UI]: ${content}`).catch((err: Error) => {
-          log("warn", "sendToChannelById (UI echo) failed:", err.message);
+          log("warn", `sendToChannelById (UI echo) failed (ns=${ns}):`, err.message);
         });
 
         // Log the incoming message
@@ -363,13 +406,13 @@ export function startNotifier(
           timestamp: originalTimestamp ?? new Date().toISOString(),
           chatId: 0, // no numeric chatId for Discord — stored by channelId string
         };
-        writeChatLog(redis, namespace, inMsg);
+        writeChatLog(redis, ns, inMsg);
 
         // Check if a meta-agent is running; if so, route there instead
         void (async () => {
           let routedToMetaAgent = false;
           try {
-            const statusRaw = await redis.get(metaAgentStatusKey(namespace));
+            const statusRaw = await redis.get(metaAgentStatusKey(ns));
             if (statusRaw) {
               const status = JSON.parse(statusRaw) as { status?: string };
               if (status.status === "running") {
@@ -378,13 +421,13 @@ export function startNotifier(
                   content,
                   timestamp: new Date().toISOString(),
                 });
-                await redis.rpush(metaInputKey(namespace), entry);
-                log("info", `cca:chat:incoming: routed to meta-agent for namespace ${namespace}`);
+                await redis.rpush(metaInputKey(ns), entry);
+                log("info", `cca:chat:incoming: routed to meta-agent for namespace ${ns}`);
                 routedToMetaAgent = true;
               }
             }
           } catch (err) {
-            log("warn", "meta-agent status check failed:", (err as Error).message);
+            log("warn", `meta-agent status check failed (ns=${ns}):`, (err as Error).message);
           }
 
           if (!routedToMetaAgent && handleUserMessage) {
@@ -392,7 +435,7 @@ export function startNotifier(
           }
         })();
       } else {
-        log("warn", "cca:chat:incoming: no active channelId to route message to");
+        log("warn", `cca:chat:incoming: no active channelId for ns=${ns}, dropping message`);
       }
     }
   });
@@ -400,6 +443,9 @@ export function startNotifier(
   return {
     registerRoutedChannelId: (ns: string, channelId: string) => {
       routedChannelIds.set(ns, channelId);
+      // Subscribe to this namespace's Redis channels so we receive its notifications
+      // and incoming UI messages. No-op if already subscribed.
+      subscribeNamespace(ns);
     },
   };
 }
