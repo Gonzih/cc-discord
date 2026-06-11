@@ -1,69 +1,13 @@
 /**
- * Routing helpers: hashtag meta-agent routing and channel-creation intent detection.
- *
- * Parses #tag or #org/repo tokens from Telegram messages and routes them to
- * the appropriate cc-agent meta-agent instead of the local Claude session.
- *
- * Tag formats:
- *   #repo-name    → namespace=repo-name, repo=https://github.com/{DEFAULT_GITHUB_ORG}/repo-name (null if DEFAULT_GITHUB_ORG unset)
- *   #org/repo     → namespace=repo,      repo=https://github.com/org/repo
+ * Routing helpers: channel-creation intent detection and meta-agent routing.
  */
 
 import { execSync } from "child_process";
 import { Redis } from "ioredis";
 import { metaAgentStatusKey, metaKey, metaInputKey } from "@gonzih/cc-wire";
 
-/** Callback type matching CcTgBot.callCcAgentTool */
+/** Callback type matching CcDiscordBot.callCcAgentTool */
 export type CallToolFn = (toolName: string, args?: Record<string, unknown>) => Promise<string | null>;
-
-export interface RoutingTag {
-  namespace: string;
-  repoUrl: string;
-  /** Original message with the tag token stripped and whitespace collapsed */
-  strippedMessage: string;
-}
-
-/**
- * Parse the first #tag or #org/repo token from a message.
- * Returns null when no routing tag is present, or when the short #repo format is used
- * without DEFAULT_GITHUB_ORG being set (operators must configure this explicitly).
- *
- * Examples:
- *   "#cc-agent fix the bug"           → null if DEFAULT_GITHUB_ORG unset; { namespace: "cc-agent", repoUrl: "…/{org}/cc-agent", … } if set
- *   "#gonzih/of-stack deploy it"      → { namespace: "of-stack", repoUrl: "…/gonzih/of-stack", … }
- *   "#org/repo do something"          → { namespace: "repo",     repoUrl: "…/org/repo", … }
- *   "please help #of-stack with this" → null if DEFAULT_GITHUB_ORG unset
- */
-export function parseRoutingTag(text: string): RoutingTag | null {
-  const defaultOrg = process.env.DEFAULT_GITHUB_ORG;
-
-  // Match #word or #org/repo — each segment: starts with alphanumeric, allows ._- inside
-  const match = text.match(/#([a-zA-Z0-9][a-zA-Z0-9._-]*)(?:\/([a-zA-Z0-9][a-zA-Z0-9._-]*))?/);
-  if (!match) return null;
-
-  const fullMatch = match[0]; // e.g. "#gonzih/of-stack"
-  const part1 = match[1];    // org-or-repo
-  const part2 = match[2];    // repo (only present in #org/repo format)
-
-  let namespace: string;
-  let repoUrl: string;
-
-  if (part2) {
-    // #org/repo format
-    namespace = part2;
-    repoUrl = `https://github.com/${part1}/${part2}`;
-  } else {
-    // #repo format — requires DEFAULT_GITHUB_ORG; return null if unset
-    if (!defaultOrg) return null;
-    namespace = part1;
-    repoUrl = `https://github.com/${defaultOrg}/${part1}`;
-  }
-
-  // Strip the matched tag token and collapse whitespace
-  const strippedMessage = text.replace(fullMatch, "").replace(/\s+/g, " ").trim();
-
-  return { namespace, repoUrl, strippedMessage };
-}
 
 /**
  * Ensure a meta-agent for the given namespace is running.
