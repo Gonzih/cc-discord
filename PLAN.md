@@ -1,38 +1,46 @@
-# Plan: @gonzih/cc-discord v0.1.0
+# Plan: @gonzih/cc-discord v0.1.1
 
 ## Task
-Build a Discord adapter for cc-suite, parallel to cc-tg. The bot connects Discord channels to Claude Code sessions and the cc-agent ecosystem (meta-agents, crons, Redis pub/sub bridge).
 
-## Approach
+Two changes in one PR:
+1. **Bug fix**: double-notification when Claude responds — the bot writes to Redis with `source:"claude"`, which the notifier's `pmessage` handler picks up and sends a second Discord message.
+2. **Feature**: channel-creation from Discord messages and `/channel` slash command — user types "channel for https://github.com/org/repo" or `/channel repo:URL` to create a new Discord text channel mapped to a meta-agent.
 
-**Option A: Port cc-tg verbatim, swap Telegram→Discord API**
-Trade-offs: Maximum feature parity, fastest path. Discord.js v14 has a different event/interaction model (slash commands via REST+interactionCreate vs. text commands). Session key stays string-based.
+## Root cause of double-notification
 
-**Option B: Start fresh with minimal Discord bot**
-Trade-offs: Cleaner code, but loses cc-tg battle-tested patterns (usage-limit retry, cron, meta-agent routing).
+`flushSession` (bot.ts:574) calls:
+```
+this.writeChatMessage("assistant", "claude", text, channelId);
+```
+`writeChatLog` publishes to `cca:chat:outgoing:{namespace}`. The notifier's `pmessage` handler (notifier.ts:207) checks:
+```
+if (parsed.source !== "claude") return;
+```
+So it ONLY forwards messages with `source === "claude"` — which is exactly what the bot just wrote. This causes a second Discord message with the `← [ns]` prefix.
 
-**Option C: Thin wrapper that delegates all state to Redis**
-Trade-offs: Stateless, horizontally scalable — but over-engineered for a single-user bot.
+**Fix**: Change the `source` argument in `flushSession`'s `writeChatMessage` call from `"claude"` to `"discord"`. The notifier guard then drops it.
 
-**Chosen: Option A** — port cc-tg, swap Telegram API for Discord.js v14. Reuse claude.ts, router.ts, cron.ts, voice.ts, tokens.ts verbatim. Adapt formatter.ts (Discord markdown ≈ standard markdown, no HTML). Write new bot.ts and notifier.ts using discord.js v14 patterns.
+## Channel creation feature
+
+### Approach
+- Add `parseChannelCreateIntent(text)` to `router.ts` — detects "channel for https://github.com/org/repo" patterns.
+- Add `channelNamespaceMap` to `CcDiscordBot` — tracks created-channel-id → {namespace, repoUrl}.
+- In `handleMessage`: check intent first, then check map routing, then existing routing.
+- Add `createChannelForRepo` helper that: creates Discord channel, registers mapping, calls `ensureMetaAgent`, replies with confirmation.
+- Add `/channel` slash command as an alternative to natural language.
+
+### Message flow in created channels
+1. User sends message in a created channel
+2. `channelNamespaceMap.has(channelId)` is true → route directly to meta-agent via `routeToMetaAgent`
+3. Bot does NOT create a local Claude session for these channels
 
 ## Files to touch
-- `package.json` — new
-- `tsconfig.json` — new (copy cc-tg)
-- `src/claude.ts` — verbatim copy
-- `src/router.ts` — verbatim copy
-- `src/cron.ts` — verbatim copy (chatId: number; Discord snowflakes converted via bitmask)
-- `src/voice.ts` — verbatim copy
-- `src/tokens.ts` — verbatim copy
-- `src/formatter.ts` — adapted (Discord markdown, 2000-char splits)
-- `src/bot.ts` — new (CcDiscordBot class, discord.js v14)
-- `src/notifier.ts` — new (DiscordNotifier, Redis pub/sub → Discord channels)
-- `src/index.ts` — new entry point
-- `launchd/com.feral.cc-discord.plist` — launchd service definition
+- `src/bot.ts` — fix flushSession, add channelNamespaceMap, handleMessage changes, createChannelForRepo, /channel command
+- `src/router.ts` — add parseChannelCreateIntent
+- `src/router.test.ts` — add parseChannelCreateIntent tests
+- `package.json` — version bump 0.1.0 → 0.1.1
 
-## Risks and unknowns
-- Discord snowflake IDs exceed Number.MAX_SAFE_INTEGER — cron.ts uses `chatId: number`. Mitigation: bitmask to 53-bit safe range consistently.
-- discord.js v14 requires Node 16.11+; cc-tg targets ES2022 — compatible.
-- Slash commands require bot to have `applications.commands` OAuth scope in the guild.
-- Discord has a 2000-char message limit vs. Telegram's 4096.
-- Voice: Discord sends audio as attachment URLs (no server-side file ID lookup like Telegram). Need to download from attachment.url directly.
+## Risks
+- `guild.channels.create` requires the bot to have `ManageChannels` permission — will throw if missing; caught and reported to user.
+- `ensureMetaAgent` can take up to 10s — reply should come before it completes (async); use fire-and-forget after channel creation confirmation.
+- `/channel` slash command needs to be added to the registration list and handler switch.
