@@ -112,6 +112,7 @@ const notifier = startNotifier(
   (channelId, text) => handleUserMessageFn?.(channelId, text),
   (channelId, text) => forwardNotificationFn?.(channelId, text),
   () => getLastActiveChannelIdFn(),
+  (n) => bot.reverseSnowflakeLookup(n),
 );
 console.log(`[notifier] started for namespace=${namespace} notifyChannelId=${notifyChannelId ?? "dynamic"}`);
 

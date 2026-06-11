@@ -191,6 +191,12 @@ export class CcDiscordBot {
       this.registerSlashCommands().catch((err: Error) => {
         console.error("[discord] slash command registration failed:", err.message);
       });
+      // Pre-populate snowflakeMap so reverse-lookup works for all channels visible at login
+      for (const [, guild] of readyClient.guilds.cache) {
+        for (const [, channel] of guild.channels.cache) {
+          this.storeSnowflake(channel.id);
+        }
+      }
     });
 
     this.client.on(Events.MessageCreate, (msg) => {
@@ -223,7 +229,7 @@ export class CcDiscordBot {
     return n;
   }
 
-  private reverseSnowflakeLookup(n: number): string | undefined {
+  public reverseSnowflakeLookup(n: number): string | undefined {
     return this.snowflakeMap.get(n);
   }
 
@@ -780,7 +786,11 @@ export class CcDiscordBot {
         if (jobs.length === 0) {
           await interaction.reply("No cron jobs for this channel.");
         } else {
-          const lines = jobs.map((j) => `• **${j.id}** ${j.schedule}: \`${j.prompt}\``);
+          const lines = jobs.map((j) => {
+            const chanId = this.reverseSnowflakeLookup(j.chatId);
+            const chanMention = chanId ? ` <#${chanId}>` : "";
+            return `• **${j.id}**${chanMention} ${j.schedule}: \`${j.prompt}\``;
+          });
           await interaction.reply(lines.join("\n"));
         }
         break;
