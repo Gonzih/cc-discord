@@ -238,6 +238,7 @@ export function startNotifier(
   const metaAgentBuffers = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> | null }>();
 
   function flushMetaAgentBuffer(ns: string, targetChannelId: string): void {
+    bot.stopMetaAgentTyping(targetChannelId);
     const buf = metaAgentBuffers.get(ns);
     if (!buf || !buf.text.trim()) return;
     const text = `← [${ns}] ` + stripAnsi(buf.text.trim());

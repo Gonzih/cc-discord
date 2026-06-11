@@ -311,6 +311,28 @@ export class CcDiscordBot {
     }
   }
 
+  /** Typing intervals for meta-agent routed channels — keyed by channelId. */
+  private metaAgentTypingTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+  /** Start (or reset) the typing indicator for a meta-agent–routed channel. */
+  private startMetaAgentTyping(channelId: string, channel: SendableChannel): void {
+    this.stopMetaAgentTyping(channelId);
+    (channel as TextChannel).sendTyping().catch(() => {});
+    this.metaAgentTypingTimers.set(
+      channelId,
+      setInterval(() => { (channel as TextChannel).sendTyping().catch(() => {}); }, TYPING_INTERVAL_MS)
+    );
+  }
+
+  /** Stop the typing indicator for a meta-agent–routed channel. Called by the notifier on flush. */
+  public stopMetaAgentTyping(channelId: string): void {
+    const timer = this.metaAgentTypingTimers.get(channelId);
+    if (timer) {
+      clearInterval(timer);
+      this.metaAgentTypingTimers.delete(channelId);
+    }
+  }
+
   /** Session key: "channelId" or "channelId:threadId" for threads */
   private sessionKey(channelId: string, threadId?: string): string {
     return threadId ? `${channelId}:${threadId}` : channelId;
@@ -462,6 +484,7 @@ export class CcDiscordBot {
       this.writeChatMessage("user", "discord", text, effectiveChannelId, mappedNs.namespace);
       this.opts.registerRoutedChannelId?.(mappedNs.namespace, effectiveChannelId);
       this.persistChannelMapping(effectiveChannelId, mappedNs.namespace, mappedNs.repoUrl);
+      this.startMetaAgentTyping(effectiveChannelId, msg.channel as SendableChannel);
       const username = msg.member?.displayName ?? msg.author.username;
       try {
         await routeToMetaAgent(mappedNs.namespace, stampPrompt(text, username, msg.createdAt), this.redis);
@@ -516,6 +539,7 @@ export class CcDiscordBot {
         this.writeChatMessage("user", "discord", fullText, channelId, mappedNs.namespace);
         this.opts.registerRoutedChannelId?.(mappedNs.namespace, channelId);
         this.persistChannelMapping(channelId, mappedNs.namespace, mappedNs.repoUrl);
+        this.startMetaAgentTyping(channelId, channel);
         try {
           await routeToMetaAgent(mappedNs.namespace, prompt, this.redis);
         } catch (err) {
@@ -565,6 +589,7 @@ export class CcDiscordBot {
         this.writeChatMessage("user", "discord", fullText, channelId, mappedNs.namespace);
         this.opts.registerRoutedChannelId?.(mappedNs.namespace, channelId);
         this.persistChannelMapping(channelId, mappedNs.namespace, mappedNs.repoUrl);
+        this.startMetaAgentTyping(channelId, channel);
         try {
           await routeToMetaAgent(mappedNs.namespace, prompt, this.redis);
         } catch (err) {
@@ -610,6 +635,7 @@ export class CcDiscordBot {
       this.writeChatMessage("user", "discord", fullText, channelId, mappedNs.namespace);
       this.opts.registerRoutedChannelId?.(mappedNs.namespace, channelId);
       this.persistChannelMapping(channelId, mappedNs.namespace, mappedNs.repoUrl);
+      this.startMetaAgentTyping(channelId, channel);
       try {
         await routeToMetaAgent(mappedNs.namespace, prompt, this.redis);
       } catch (err) {
@@ -1184,6 +1210,9 @@ export class CcDiscordBot {
       if (session.typingTimer) clearInterval(session.typingTimer);
       session.claude.kill();
       this.sessions.delete(key);
+    }
+    for (const [channelId] of this.metaAgentTypingTimers) {
+      this.stopMetaAgentTyping(channelId);
     }
     void this.client.destroy();
   }
