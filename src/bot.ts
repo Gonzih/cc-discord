@@ -413,6 +413,20 @@ export class CcDiscordBot {
     text = text.replace(/<@!?\d+>/g, "").trim();
     if (!text) return;
 
+    // Prepend replied-to message content so Claude can resurrect context
+    if (msg.reference?.messageId) {
+      try {
+        const referenced = await msg.channel.messages.fetch(msg.reference.messageId);
+        const refContent = referenced.content.length > 300
+          ? referenced.content.slice(0, 300) + "…"
+          : referenced.content;
+        const refAuthor = referenced.member?.displayName ?? referenced.author.username;
+        text = `> [replying to ${refAuthor}]: ${refContent}\n${text}`;
+      } catch {
+        // Referenced message unavailable — proceed without context
+      }
+    }
+
     // Natural-language channel creation: "channel for https://github.com/org/repo"
     if (this.redis) {
       const intent = parseChannelCreateIntent(text);
