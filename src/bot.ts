@@ -461,6 +461,7 @@ export class CcDiscordBot {
     if (mappedNs && this.redis) {
       this.writeChatMessage("user", "discord", text, effectiveChannelId, mappedNs.namespace);
       this.opts.registerRoutedChannelId?.(mappedNs.namespace, effectiveChannelId);
+      this.persistChannelMapping(effectiveChannelId, mappedNs.namespace, mappedNs.repoUrl);
       const username = msg.member?.displayName ?? msg.author.username;
       try {
         await routeToMetaAgent(mappedNs.namespace, stampPrompt(text, username, msg.createdAt), this.redis);
@@ -470,7 +471,15 @@ export class CcDiscordBot {
       return;
     }
 
-    // Local Claude session
+    // Unknown guild channel — reject rather than silently start a local session with wrong context
+    if (msg.guild) {
+      await (msg.channel as TextChannel).send(
+        "This channel is not configured. Use `channel for https://github.com/org/repo` to set it up."
+      ).catch(() => {});
+      return;
+    }
+
+    // Local Claude session (DMs only beyond this point)
     const session = this.getOrCreateSession(effectiveChannelId, msg.channel as SendableChannel);
     const username = msg.member?.displayName ?? msg.author.username;
     try {
@@ -506,6 +515,7 @@ export class CcDiscordBot {
       if (mappedNs && this.redis) {
         this.writeChatMessage("user", "discord", fullText, channelId, mappedNs.namespace);
         this.opts.registerRoutedChannelId?.(mappedNs.namespace, channelId);
+        this.persistChannelMapping(channelId, mappedNs.namespace, mappedNs.repoUrl);
         try {
           await routeToMetaAgent(mappedNs.namespace, prompt, this.redis);
         } catch (err) {
@@ -554,6 +564,7 @@ export class CcDiscordBot {
         const prompt = stampPrompt(fullText, imgUsername, msg.createdAt);
         this.writeChatMessage("user", "discord", fullText, channelId, mappedNs.namespace);
         this.opts.registerRoutedChannelId?.(mappedNs.namespace, channelId);
+        this.persistChannelMapping(channelId, mappedNs.namespace, mappedNs.repoUrl);
         try {
           await routeToMetaAgent(mappedNs.namespace, prompt, this.redis);
         } catch (err) {
@@ -598,6 +609,7 @@ export class CcDiscordBot {
     if (mappedNs && this.redis) {
       this.writeChatMessage("user", "discord", fullText, channelId, mappedNs.namespace);
       this.opts.registerRoutedChannelId?.(mappedNs.namespace, channelId);
+      this.persistChannelMapping(channelId, mappedNs.namespace, mappedNs.repoUrl);
       try {
         await routeToMetaAgent(mappedNs.namespace, prompt, this.redis);
       } catch (err) {
