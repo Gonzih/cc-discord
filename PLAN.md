@@ -1,39 +1,44 @@
-# Plan: Fix channel→namespace mappings lost on cc-discord restart
+# Plan: Typing indicator when routing to meta-agent
 
 ## Task
-Channel→namespace mappings are in-memory only for channels registered via `createChannelForRepo`
-or `/channel` slash command. While `persistChannelMapping` is called in those paths, the 4
-callsites inside the message-handler methods (`handleMessage`, `handleVoice`, `handleImage`,
-`handleDocument`) call `registerRoutedChannelId` but skip `persistChannelMapping`. Additionally,
-when a mapping is absent (e.g. after a restart with a lost/never-persisted mapping), the bot
-silently falls through to a local Claude session with money-brain context, leaking into the
-wrong channel.
-
-## Root Cause
-- Only `createChannelForRepo` and the `/channel` slash command call `persistChannelMapping`.
-- If a mapping was created by an older bot version (before persist existed) or was evicted from
-  Redis, after restart it's gone, and messages fall through to local Claude.
+When a Discord message is routed to a meta-agent via `routeToMetaAgent`, the channel shows
+no typing indicator while the agent works. The user sees silence until the response arrives.
+Fix: start a repeating typing indicator on the Discord channel when routing to a meta-agent,
+and stop it when `flushMetaAgentBuffer` fires in the notifier.
 
 ## Approach
-Two-part fix (as specified in task brief):
 
-**Part 1 — Persist on use:** In the 4 handler spots where `registerRoutedChannelId` is called
-(handleMessage line 463, handleVoice line 508, handleImage line 556, handleDocument line 600),
-also call `persistChannelMapping`. This idempotently re-writes the Redis key on each message,
-so the mapping survives future restarts.
+The meta-agent path involves two components:
+- `bot.ts` — receives the message, calls `routeToMetaAgent` to RPUSH to Redis
+- `notifier.ts` — listens for `cca:chat:outgoing:{ns}` pmessage events, buffers chunks,
+  and flushes to Discord after 1500ms silence via `flushMetaAgentBuffer`
 
-**Part 2 — Reject unknown guild channels:** In `handleMessage`, after the `mappedNs` block and
-before the local Claude fallback, reject guild channels that have no mapping. Reply with a
-helpful "not configured" message and return early. DMs (msg.guild == null) still fall through
-to local Claude.
+The `bot` instance is already in scope inside `startNotifier` (first parameter), so the
+notifier can call methods on it directly — no new callbacks needed.
+
+### Implementation
+
+**bot.ts:**
+1. Add `metaAgentTypingTimers: Map<string, ReturnType<typeof setInterval>>` private field
+2. Add private `startMetaAgentTyping(channelId, channel)` — immediate sendTyping + 9s interval
+3. Add public `stopMetaAgentTyping(channelId)` — clears and removes the interval
+4. Call `startMetaAgentTyping` in the 4 meta-agent routing paths:
+   - `handleMessage` (before `routeToMetaAgent`)
+   - `handleVoice` (before `routeToMetaAgent`)
+   - `handleImage` (before `routeToMetaAgent`)
+   - `handleDocument` (before `routeToMetaAgent`)
+5. Update `stop()` to also clear `metaAgentTypingTimers`
+
+**notifier.ts:**
+1. Call `bot.stopMetaAgentTyping(targetChannelId)` at the top of `flushMetaAgentBuffer`
+   (before the early-return guard, so it always clears even if buffer is empty)
 
 ## Files to touch
-- `src/bot.ts` — 4 callsites for Part 1; add rejection block for Part 2
-- `src/bot.test.ts` — add tests for the `stampPrompt` and any new exported helpers
-  (Part 2 rejection logic is in private method; tested manually via smoke test)
+- `src/bot.ts` — 3 new methods + 4 call sites
+- `src/notifier.ts` — 1-line addition in `flushMetaAgentBuffer`
+- `src/notifier.test.ts` — update `buildMocks()` + add flush-stops-typing test
 
 ## Risks
-- Part 2 is a UX-breaking change: existing users relying on local Claude sessions in guild
-  channels (e.g. the primary money-brain channel) will see "not configured" until they run
-  "channel for https://..." to register the channel explicitly.
-- DMs are preserved (msg.guild null check).
+- `sendTyping` can throw on closed channels — already guarded with `.catch(() => {})` everywhere
+- Typing timer would run forever if meta-agent never responds (no timeout) — acceptable for now;
+  stopMetaAgentTyping is idempotent so a later flush cleans it up

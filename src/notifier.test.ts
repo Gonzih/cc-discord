@@ -106,10 +106,14 @@ describe("parseNotification", () => {
 function buildMocks() {
   // Track messages sent by the bot
   const sent: Array<{ channelId: string; text: string }> = [];
+  const stoppedTyping: string[] = [];
   const mockBot = {
     sendToChannelById: vi.fn((channelId: string, text: string) => {
       sent.push({ channelId, text });
       return Promise.resolve();
+    }),
+    stopMetaAgentTyping: vi.fn((channelId: string) => {
+      stoppedTyping.push(channelId);
     }),
   };
 
@@ -138,7 +142,7 @@ function buildMocks() {
     llen: vi.fn().mockResolvedValue(0),
   };
 
-  return { mockBot, mockSub, mockRedis, sent, listQueues };
+  return { mockBot, mockSub, mockRedis, sent, stoppedTyping, listQueues };
 }
 
 describe("startNotifier — pmessage (cca:chat:outgoing:*)", () => {
@@ -186,6 +190,27 @@ describe("startNotifier — pmessage (cca:chat:outgoing:*)", () => {
 
     expect(sent).toContainEqual(expect.objectContaining({ channelId: "discord-ch-555" }));
     expect(sent.every((m) => m.channelId !== "primary-notify-ch")).toBe(true);
+  });
+
+  it("calls stopMetaAgentTyping on the target channel when meta-agent buffer flushes", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockSub, mockRedis, stoppedTyping } = buildMocks();
+
+    const handle = startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    handle.registerRoutedChannelId("simorgh", "discord-ch-888");
+
+    const msg = JSON.stringify({ source: "claude", content: "agent reply" });
+    mockSub.emit("pmessage", "cca:chat:outgoing:*", "cca:chat:outgoing:simorgh", msg);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(stoppedTyping).toContain("discord-ch-888");
   });
 });
 
