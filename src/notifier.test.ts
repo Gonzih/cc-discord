@@ -1,5 +1,29 @@
 import { describe, it, expect } from "vitest";
-import { parseNotification } from "./notifier.js";
+import { parseNotification, resolveNotifyChannel } from "./notifier.js";
+
+describe("resolveNotifyChannel", () => {
+  it("returns reverseSnowflakeLookup result when chatId and lookup available", () => {
+    const lookup = (n: number) => (n === 42 ? "channel-42" : undefined);
+    expect(resolveNotifyChannel(42, "notify-channel", undefined, lookup)).toBe("channel-42");
+  });
+
+  it("falls back to notifyChannelId when reverseSnowflakeLookup returns undefined", () => {
+    const lookup = (_n: number) => undefined;
+    expect(resolveNotifyChannel(42, "notify-channel", undefined, lookup)).toBe("notify-channel");
+  });
+
+  it("falls back to notifyChannelId when chatId is undefined", () => {
+    expect(resolveNotifyChannel(undefined, "notify-channel", undefined, undefined)).toBe("notify-channel");
+  });
+
+  it("falls back to getActiveChannelId when notifyChannelId is null", () => {
+    expect(resolveNotifyChannel(undefined, null, () => "active-channel", undefined)).toBe("active-channel");
+  });
+
+  it("returns undefined when no fallbacks available", () => {
+    expect(resolveNotifyChannel(undefined, null, undefined, undefined)).toBeUndefined();
+  });
+});
 
 describe("parseNotification", () => {
   it("returns raw string when not JSON", () => {
