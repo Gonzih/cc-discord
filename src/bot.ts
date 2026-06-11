@@ -86,13 +86,15 @@ const FLUSH_DELAY_MS = 800;
 // Discord typing indicator: re-send every 9s (indicator expires after ~10s)
 const TYPING_INTERVAL_MS = 9000;
 
-/** Prepend [MM-DD HH:mm] so Claude knows when the message was received. */
-export function stampPrompt(text: string, now = new Date()): string {
-  const mm = String(now.getMonth() + 1).padStart(2, "0");
-  const dd = String(now.getDate()).padStart(2, "0");
+const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+/** Prepend [DayOfWeek HH:MM] username: so Claude knows when the message was received and from whom. */
+export function stampPrompt(text: string, username?: string, now = new Date()): string {
+  const day = DAYS[now.getDay()];
   const hh = String(now.getHours()).padStart(2, "0");
   const min = String(now.getMinutes()).padStart(2, "0");
-  return `[${mm}-${dd} ${hh}:${min}] ${text}`;
+  const header = username ? `[${day} ${hh}:${min}] ${username}: ` : `[${day} ${hh}:${min}] `;
+  return header + text;
 }
 
 function formatTokens(n: number): string {
@@ -380,8 +382,9 @@ export class CcDiscordBot {
     if (mappedNs && this.redis) {
       this.writeChatMessage("user", "discord", text, effectiveChannelId);
       this.opts.registerRoutedChannelId?.(mappedNs.namespace, effectiveChannelId);
+      const username = msg.member?.displayName ?? msg.author.username;
       try {
-        await routeToMetaAgent(mappedNs.namespace, text, this.redis);
+        await routeToMetaAgent(mappedNs.namespace, stampPrompt(text, username, msg.createdAt), this.redis);
       } catch (err) {
         await (msg.channel as TextChannel).send(`Failed to route to ${mappedNs.namespace}: ${(err as Error).message}`).catch(() => {});
       }
@@ -390,9 +393,10 @@ export class CcDiscordBot {
 
     // Local Claude session
     const session = this.getOrCreateSession(effectiveChannelId, msg.channel as SendableChannel);
+    const username = msg.member?.displayName ?? msg.author.username;
     try {
       session.currentPrompt = text;
-      session.claude.sendPrompt(stampPrompt(text));
+      session.claude.sendPrompt(stampPrompt(text, username, msg.createdAt));
       this.startTyping(effectiveChannelId, msg.channel as SendableChannel, session);
       this.writeChatMessage("user", "discord", text, effectiveChannelId);
     } catch (err) {
@@ -414,7 +418,8 @@ export class CcDiscordBot {
 
       const session = this.getOrCreateSession(channelId, channel);
       session.currentPrompt = transcript;
-      session.claude.sendPrompt(stampPrompt(transcript));
+      const voiceUsername = msg.member?.displayName ?? msg.author.username;
+      session.claude.sendPrompt(stampPrompt(transcript, voiceUsername, msg.createdAt));
       this.startTyping(channelId, channel, session);
       this.writeChatMessage("user", "discord", transcript, channelId);
     } catch (err) {
@@ -438,8 +443,9 @@ export class CcDiscordBot {
     try {
       const base64Data = await fetchAsBase64(imageUrl);
       const caption = msg.content.trim() || "";
+      const imgUsername = msg.member?.displayName ?? msg.author.username;
       const session = this.getOrCreateSession(channelId, channel);
-      session.claude.sendImage(base64Data, contentType, stampPrompt(caption));
+      session.claude.sendImage(base64Data, contentType, stampPrompt(caption, imgUsername, msg.createdAt));
       this.startTyping(channelId, channel, session);
     } catch (err) {
       await (channel as TextChannel).send(`Failed to process image: ${(err as Error).message}`).catch(() => {});
