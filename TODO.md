@@ -1,17 +1,17 @@
-# TODO: cc-wire 0.1.6 integration
+# TODO: Fix channel-namespace routing
 
-- [x] Install @gonzih/cc-wire@0.1.6 and verify exports
-- [x] Write PLAN.md and TODO.md
-- [ ] Create branch chore/cc-wire-0.1.6
-- [ ] notifier.ts: import NotificationPayload, Transport, notifyListKey from cc-wire
-- [ ] notifier.ts: replace inline type cast with NotificationPayload in parseNotification()
-- [ ] notifier.ts: add routing filter (return null when discord excluded)
-- [ ] notifier.ts: update parseNotification return type to ParsedNotification | null
-- [ ] notifier.ts: update both callers to handle null
-- [ ] notifier.ts: use notifyListKey(namespace) instead of local notifyListKey variable
-- [ ] notifier.test.ts: add routing filter tests
-- [ ] npm test — must pass
-- [ ] git diff --staged review
+- [ ] git checkout -b fix/channel-namespace-routing
+- [ ] notifier.ts: fix pmessage fallback — only fall back to money-brain for primary namespace (Bug 1)
+- [ ] notifier.ts: dynamic subscribe — when registerRoutedChannelId called, subscribe to notify+incoming for that ns (Bug 3)
+- [ ] notifier.ts: update message handler to route notify events for all subscribed namespaces
+- [ ] bot.ts: add persistChannelMapping helper — write cca:discord:channel:{channelId} to Redis
+- [ ] bot.ts: call persistChannelMapping in createChannelForRepo and /channel slash command (Bug 2)
+- [ ] bot.ts: add loadChannelMappings() method — scan Redis on startup, populate channelNamespaceMap+registerRoutedChannelId (Bug 2)
+- [ ] bot.ts: call loadChannelMappings in index.ts after notifier starts
+- [ ] bot.ts: fix writeChatMessage to use correct namespace for routed channels (Bug 4)
+- [ ] notifier.test.ts: add tests for namespace isolation (pmessage doesn't leak to wrong channel)
+- [ ] npm test — all tests pass
+- [ ] git diff --staged — review every change
 - [ ] git commit + push
 - [ ] npm run build && npm version patch && npm publish --access public
 - [ ] gh pr create + gh pr merge --squash --auto

@@ -120,6 +120,11 @@ const notifier = startNotifier(
 );
 console.log(`[notifier] started for namespace=${namespace} notifyChannelId=${notifyChannelId ?? "dynamic"}`);
 
+// Restore persisted channel→namespace mappings so routing survives restarts
+bot.loadChannelMappings().catch((err: Error) => {
+  console.warn("[cc-discord] loadChannelMappings failed:", err.message);
+});
+
 // Wire closures now that bot is constructed
 getLastActiveChannelIdFn = () => bot.getLastActiveChannelId();
 handleUserMessageFn = (channelId, text) => { void bot.handleUserMessage(channelId, text); };
