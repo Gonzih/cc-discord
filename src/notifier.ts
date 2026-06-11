@@ -288,23 +288,20 @@ export function startNotifier(
     buf.timer = setTimeout(() => flushMetaAgentBuffer(ns, targetChannelId), META_AGENT_FLUSH_DELAY_MS);
   });
 
-  // Poll the notifyListKey(namespace) LIST every 5 seconds
-  const notifyListRedisKey = notifyListKey(namespace);
+  // Poll notifyListKey(ns) LIST every 5 seconds — covers primary + all routed namespaces.
   const MAX_PER_CYCLE = 20;
 
-  const pollNotifyList = async (): Promise<void> => {
-    const targetId = notifyChannelId ?? getActiveChannelId?.();
-    if (targetId == null) return;
-
+  const pollOneNamespace = async (ns: string, targetChannelId: string): Promise<void> => {
+    const listKey = notifyListKey(ns);
     const items: string[] = [];
     try {
       for (let i = 0; i < MAX_PER_CYCLE; i++) {
-        const item = await redis.rpop(notifyListRedisKey);
+        const item = await redis.rpop(listKey);
         if (item === null) break;
         items.push(item);
       }
     } catch (err) {
-      log("warn", "notify list rpop failed:", (err as Error).message);
+      log("warn", `notify list rpop failed (ns=${ns}):`, (err as Error).message);
       return;
     }
 
@@ -313,18 +310,22 @@ export function startNotifier(
     let remaining = 0;
     if (items.length === MAX_PER_CYCLE) {
       try {
-        remaining = await redis.llen(notifyListRedisKey);
+        remaining = await redis.llen(listKey);
       } catch (err) {
-        log("warn", "notify list llen failed:", (err as Error).message);
+        log("warn", `notify list llen failed (ns=${ns}):`, (err as Error).message);
       }
     }
 
     for (const raw of items) {
       const notification = parseNotification(raw);
       if (notification === null) continue; // routing excludes discord
-      const destChannelId = resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup) ?? targetId;
+      // Primary namespace: honour chatId-based per-channel routing via reverseSnowflakeLookup.
+      // Routed namespaces: always deliver to the registered Discord channelId — no leakage.
+      const destChannelId = ns === namespace
+        ? (resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup) ?? targetChannelId)
+        : targetChannelId;
       bot.sendToChannelById(destChannelId, notification.text).catch((err: Error) => {
-        log("warn", "notify list send failed:", err.message);
+        log("warn", `notify list send failed (ns=${ns}):`, err.message);
       });
       if (forwardNotification) {
         forwardNotification(destChannelId, notification.text);
@@ -332,9 +333,23 @@ export function startNotifier(
     }
 
     if (remaining > 0) {
-      bot.sendToChannelById(targetId, `...and ${remaining} more notifications`).catch((err: Error) => {
-        log("warn", "notify list summary send failed:", err.message);
+      bot.sendToChannelById(targetChannelId, `...and ${remaining} more notifications`).catch((err: Error) => {
+        log("warn", `notify list summary send failed (ns=${ns}):`, err.message);
       });
+    }
+  };
+
+  const pollNotifyList = async (): Promise<void> => {
+    // Primary namespace
+    const primaryTargetId = notifyChannelId ?? getActiveChannelId?.();
+    if (primaryTargetId != null) {
+      await pollOneNamespace(namespace, primaryTargetId);
+    }
+    // All registered routed namespaces
+    for (const [ns, channelId] of routedChannelIds) {
+      if (ns !== namespace) {
+        await pollOneNamespace(ns, channelId);
+      }
     }
   };
 
