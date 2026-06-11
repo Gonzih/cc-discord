@@ -1,5 +1,6 @@
-import { describe, it, expect } from "vitest";
-import { parseNotification, resolveNotifyChannel } from "./notifier.js";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { parseNotification, resolveNotifyChannel, startNotifier } from "./notifier.js";
+import { notifyListKey } from "@gonzih/cc-wire";
 
 describe("resolveNotifyChannel", () => {
   it("returns reverseSnowflakeLookup result when chatId and lookup available", () => {
@@ -98,5 +99,136 @@ describe("parseNotification", () => {
   it("delivers when routing is an empty array", () => {
     const payload = JSON.stringify({ text: "done", routing: [] });
     expect(parseNotification(payload)).toEqual({ text: "done" });
+  });
+});
+
+/** Build the minimal mocks needed to call startNotifier without a real Redis or Discord client. */
+function buildMocks() {
+  // Track messages sent by the bot
+  const sent: Array<{ channelId: string; text: string }> = [];
+  const mockBot = {
+    sendToChannelById: vi.fn((channelId: string, text: string) => {
+      sent.push({ channelId, text });
+      return Promise.resolve();
+    }),
+  };
+
+  // Subscriber redis (returned by redis.duplicate()) — events are emitted manually in tests
+  const subHandlers: Record<string, ((...args: unknown[]) => void)[]> = {};
+  const mockSub = {
+    on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+      subHandlers[event] = subHandlers[event] ?? [];
+      subHandlers[event].push(handler);
+    }),
+    subscribe: vi.fn((_ch: string, cb?: (err: Error | null) => void) => cb?.(null)),
+    psubscribe: vi.fn((_pat: string, cb?: (err: Error | null) => void) => cb?.(null)),
+    emit: (event: string, ...args: unknown[]) => {
+      subHandlers[event]?.forEach((h) => h(...args));
+    },
+  };
+
+  // Queued rpop responses per list key
+  const listQueues = new Map<string, string[]>();
+  const mockRedis = {
+    duplicate: vi.fn().mockReturnValue(mockSub),
+    rpop: vi.fn(async (key: string) => {
+      const q = listQueues.get(key) ?? [];
+      return q.shift() ?? null;
+    }),
+    llen: vi.fn().mockResolvedValue(0),
+  };
+
+  return { mockBot, mockSub, mockRedis, sent, listQueues };
+}
+
+describe("startNotifier — per-namespace list polling", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("polls notifyListKey for routed namespaces after registerRoutedChannelId", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockRedis, sent, listQueues } = buildMocks();
+
+    const routedListKey = notifyListKey("simorgh");
+    listQueues.set(routedListKey, [JSON.stringify({ text: "job done" })]);
+
+    const handle = startNotifier(
+      mockBot as never,
+      null,
+      "money-brain",
+      mockRedis as never,
+    );
+
+    handle.registerRoutedChannelId("simorgh", "discord-ch-999");
+
+    // Advance past the 5-second poll interval
+    await vi.advanceTimersByTimeAsync(5_100);
+
+    expect(sent).toContainEqual({ channelId: "discord-ch-999", text: "job done" });
+  });
+
+  it("does not deliver routed-namespace notifications to the primary channel", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockRedis, sent, listQueues } = buildMocks();
+
+    const routedListKey = notifyListKey("simorgh");
+    listQueues.set(routedListKey, [JSON.stringify({ text: "simorgh update" })]);
+
+    const handle = startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    handle.registerRoutedChannelId("simorgh", "discord-ch-777");
+
+    await vi.advanceTimersByTimeAsync(5_100);
+
+    // Notification goes to the routed channel, NOT to primary-notify-ch
+    expect(sent).toContainEqual({ channelId: "discord-ch-777", text: "simorgh update" });
+    expect(sent.every((m) => m.channelId !== "primary-notify-ch")).toBe(true);
+  });
+
+  it("routes primary-namespace notifications to notifyChannelId", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockRedis, sent, listQueues } = buildMocks();
+
+    const primaryListKey = notifyListKey("money-brain");
+    listQueues.set(primaryListKey, [JSON.stringify({ text: "primary done" })]);
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    await vi.advanceTimersByTimeAsync(5_100);
+
+    expect(sent).toContainEqual({ channelId: "primary-notify-ch", text: "primary done" });
+  });
+
+  it("skips routing-excluded notifications from routed namespace list", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockRedis, sent, listQueues } = buildMocks();
+
+    const routedListKey = notifyListKey("simorgh");
+    listQueues.set(routedListKey, [JSON.stringify({ text: "telegram only", routing: ["telegram"] })]);
+
+    const handle = startNotifier(
+      mockBot as never,
+      null,
+      "money-brain",
+      mockRedis as never,
+    );
+
+    handle.registerRoutedChannelId("simorgh", "discord-ch-444");
+
+    await vi.advanceTimersByTimeAsync(5_100);
+
+    // routing: ["telegram"] excludes discord — nothing should be sent
+    expect(sent).toHaveLength(0);
   });
 });
