@@ -49,32 +49,40 @@ function shortenModelName(model: string, driver: string): string {
   return model;
 }
 
+export interface ParsedNotification {
+  text: string;
+  chatId?: number;
+}
+
 /**
- * Parse a notification payload and return the display text.
- * Appends a [driver] or [driver:model] badge whenever the driver field is present.
+ * Parse a notification payload.
+ * Returns the display text plus an optional chatId for per-channel routing.
+ * Appends a [driver] or [driver:model] badge when present.
  * Appends " cost: $X.XXX" if a numeric cost field is present.
  */
-export function parseNotification(raw: string): string {
+export function parseNotification(raw: string): ParsedNotification {
   let text = raw;
   let driver: string | undefined;
   let model: string | undefined;
   let cost: number | undefined;
+  let chatId: number | undefined;
   try {
-    const parsed = JSON.parse(raw) as { text?: string; driver?: string; model?: string; cost?: number };
+    const parsed = JSON.parse(raw) as { text?: string; driver?: string; model?: string; cost?: number; chat_id?: number };
     if (parsed.text) text = parsed.text;
     driver = parsed.driver;
     model = parsed.model;
     if (typeof parsed.cost === "number") cost = parsed.cost;
+    if (typeof parsed.chat_id === "number" && parsed.chat_id !== 0) chatId = parsed.chat_id;
   } catch {
-    return text;
+    return { text };
   }
 
-  if (!driver) return text;
+  if (!driver) return { text, chatId };
 
   const shortModel = shortenModelName(model ?? "", driver);
   const badge = shortModel ? `${driver}:${shortModel}` : driver;
   const costStr = cost != null ? ` cost: $${cost.toFixed(3)}` : "";
-  return `${text}\n[${badge}]${costStr}`;
+  return { text: `${text}\n[${badge}]${costStr}`, chatId };
 }
 
 /**
@@ -100,6 +108,24 @@ export function writeChatLog(
   });
 }
 
+/**
+ * Resolve the target Discord channelId for a notification.
+ * When chatId is set and a reverse-lookup function is available, prefer the originating channel.
+ * Falls back to notifyChannelId, then getActiveChannelId.
+ */
+function resolveNotifyChannel(
+  chatId: number | undefined,
+  notifyChannelId: string | null,
+  getActiveChannelId?: () => string | undefined,
+  reverseSnowflakeLookup?: (n: number) => string | undefined
+): string | undefined {
+  if (chatId != null && reverseSnowflakeLookup) {
+    const resolved = reverseSnowflakeLookup(chatId);
+    if (resolved) return resolved;
+  }
+  return notifyChannelId ?? getActiveChannelId?.();
+}
+
 export interface NotifierHandle {
   /**
    * Register the originating Discord channel ID for a routed namespace.
@@ -112,13 +138,14 @@ export interface NotifierHandle {
 /**
  * Start the Discord notifier.
  *
- * @param bot               - CcDiscordBot instance (for sending messages)
- * @param notifyChannelId   - Discord channel ID to forward notifications to. Pass null to use getActiveChannelId.
- * @param namespace         - cc-agent namespace (used to build Redis channel names)
- * @param redis             - ioredis client in normal mode (will be duplicated for pub/sub)
- * @param handleUserMessage - Optional callback to feed UI messages into the active Claude session
- * @param forwardNotification - Optional callback to forward job notifications
- * @param getActiveChannelId  - Optional callback to resolve channelId dynamically
+ * @param bot                     - CcDiscordBot instance (for sending messages)
+ * @param notifyChannelId         - Discord channel ID to forward notifications to. Pass null to use getActiveChannelId.
+ * @param namespace               - cc-agent namespace (used to build Redis channel names)
+ * @param redis                   - ioredis client in normal mode (will be duplicated for pub/sub)
+ * @param handleUserMessage       - Optional callback to feed UI messages into the active Claude session
+ * @param forwardNotification     - Optional callback to forward job notifications
+ * @param getActiveChannelId      - Optional callback to resolve channelId dynamically
+ * @param reverseSnowflakeLookup  - Optional callback to resolve a chatId integer to a Discord channelId
  */
 export function startNotifier(
   bot: CcDiscordBot,
@@ -127,7 +154,8 @@ export function startNotifier(
   redis: Redis,
   handleUserMessage?: (channelId: string, text: string) => void,
   forwardNotification?: (channelId: string, text: string) => void,
-  getActiveChannelId?: () => string | undefined
+  getActiveChannelId?: () => string | undefined,
+  reverseSnowflakeLookup?: (n: number) => string | undefined
 ): NotifierHandle {
   // Per-namespace channelId registry
   const routedChannelIds = new Map<string, string>();
@@ -256,12 +284,13 @@ export function startNotifier(
     }
 
     for (const raw of items) {
-      const text = parseNotification(raw);
-      bot.sendToChannelById(targetId, text).catch((err: Error) => {
+      const notification = parseNotification(raw);
+      const destChannelId = resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup) ?? targetId;
+      bot.sendToChannelById(destChannelId, notification.text).catch((err: Error) => {
         log("warn", "notify list send failed:", err.message);
       });
       if (forwardNotification) {
-        forwardNotification(targetId, text);
+        forwardNotification(destChannelId, notification.text);
       }
     }
 
@@ -281,14 +310,14 @@ export function startNotifier(
     const incomingCh = chatIncomingChannel(namespace);
 
     if (channel === notifyCh) {
-      const targetId = notifyChannelId ?? getActiveChannelId?.();
+      const notification = parseNotification(message);
+      const targetId = resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup);
       if (targetId != null) {
-        const text = parseNotification(message);
-        bot.sendToChannelById(targetId, text).catch((err: Error) => {
+        bot.sendToChannelById(targetId, notification.text).catch((err: Error) => {
           log("warn", "notify send failed:", err.message);
         });
         if (forwardNotification) {
-          forwardNotification(targetId, text);
+          forwardNotification(targetId, notification.text);
         }
       } else {
         log("warn", "notify: no channelId available, dropping notification");

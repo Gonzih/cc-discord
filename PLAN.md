@@ -1,46 +1,51 @@
-# Plan: @gonzih/cc-discord v0.1.1
+# Plan: @gonzih/cc-discord v0.1.3 — per-channel cron routing
 
 ## Task
 
-Two changes in one PR:
-1. **Bug fix**: double-notification when Claude responds — the bot writes to Redis with `source:"claude"`, which the notifier's `pmessage` handler picks up and sends a second Discord message.
-2. **Feature**: channel-creation from Discord messages and `/channel` slash command — user types "channel for https://github.com/org/repo" or `/channel repo:URL` to create a new Discord text channel mapped to a meta-agent.
+Route cron completion notifications (`cca:notify:{namespace}`) to the Discord channel that
+created the cron, instead of always sending to `DISCORD_NOTIFY_CHANNEL_ID`.
 
-## Root cause of double-notification
+## Current state
 
-`flushSession` (bot.ts:574) calls:
-```
-this.writeChatMessage("assistant", "claude", text, channelId);
-```
-`writeChatLog` publishes to `cca:chat:outgoing:{namespace}`. The notifier's `pmessage` handler (notifier.ts:207) checks:
-```
-if (parsed.source !== "claude") return;
-```
-So it ONLY forwards messages with `source === "claude"` — which is exactly what the bot just wrote. This causes a second Discord message with the `← [ns]` prefix.
+- `CronJob.chatId` is already stored as a 53-bit integer (snowflake-derived).
+- `storeSnowflake(id)` / `reverseSnowflakeLookup(n)` exist on `CcDiscordBot` (both private).
+- The CronManager fire callback already does reverse-lookup → `runCronTask(channelId, ...)`.
+- But `notifier.ts` `pollNotifyList` / `sub.on("message")` ignore `chat_id` in the notification
+  payload and always route to `notifyChannelId ?? getActiveChannelId()`.
 
-**Fix**: Change the `source` argument in `flushSession`'s `writeChatMessage` call from `"claude"` to `"discord"`. The notifier guard then drops it.
+## What needs to change
 
-## Channel creation feature
+### 1. bot.ts — ClientReady: pre-populate snowflakeMap
+All guild channels visible at login are pre-stored so reverse-lookup works even for channels
+that have never sent a message to the bot.
 
-### Approach
-- Add `parseChannelCreateIntent(text)` to `router.ts` — detects "channel for https://github.com/org/repo" patterns.
-- Add `channelNamespaceMap` to `CcDiscordBot` — tracks created-channel-id → {namespace, repoUrl}.
-- In `handleMessage`: check intent first, then check map routing, then existing routing.
-- Add `createChannelForRepo` helper that: creates Discord channel, registers mapping, calls `ensureMetaAgent`, replies with confirmation.
-- Add `/channel` slash command as an alternative to natural language.
+### 2. bot.ts — make reverseSnowflakeLookup public
+The notifier needs to call it to turn a chatId integer back into a Discord channel ID string.
 
-### Message flow in created channels
-1. User sends message in a created channel
-2. `channelNamespaceMap.has(channelId)` is true → route directly to meta-agent via `routeToMetaAgent`
-3. Bot does NOT create a local Claude session for these channels
+### 3. notifier.ts — parseNotification returns {text, chatId?}
+Add `chat_id?: number` to the parsed payload type. Return `{ text, chatId }`.
+Callers use `.text` for the message and `.chatId` for routing.
+
+### 4. notifier.ts — notify subscriber & pollNotifyList use chatId
+When `chatId` is non-zero:
+  - call `bot.reverseSnowflakeLookup(chatId)` → channelId
+  - fall back to `notifyChannelId ?? getActiveChannelId()` if lookup fails
+
+### 5. notifier.test.ts — update for new return type
+
+### 6. bot.ts — /crons list: show <#channelId> per job
+Use reverseSnowflakeLookup to add a channel mention next to each listed cron.
 
 ## Files to touch
-- `src/bot.ts` — fix flushSession, add channelNamespaceMap, handleMessage changes, createChannelForRepo, /channel command
-- `src/router.ts` — add parseChannelCreateIntent
-- `src/router.test.ts` — add parseChannelCreateIntent tests
-- `package.json` — version bump 0.1.0 → 0.1.1
+- `src/bot.ts`
+- `src/notifier.ts`
+- `src/notifier.test.ts`
+- `package.json`
 
 ## Risks
-- `guild.channels.create` requires the bot to have `ManageChannels` permission — will throw if missing; caught and reported to user.
-- `ensureMetaAgent` can take up to 10s — reply should come before it completes (async); use fire-and-forget after channel creation confirmation.
-- `/channel` slash command needs to be added to the registration list and handler switch.
+- `readyClient.guilds.cache` may not include all guilds if the cache is lazy — channels
+  added via `guild.channels.cache` at ClientReady is safe for guilds the bot is already in.
+- Notification payloads from cc-agent may use `chat_id` (snake_case) not `chatId` — reading
+  `parsed.chat_id` covers this.
+- Changing parseNotification return type is a breaking change to the exported API — tests
+  and all callers must be updated atomically.
