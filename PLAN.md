@@ -1,24 +1,29 @@
-# Plan: Include replied-to message content for context resurrection
+# Plan: Full Attachment Handling for cc-discord
 
 ## Task
-When a Discord user replies to a message, prepend the original message content
-(truncated to 300 chars) to the text forwarded to Claude so Claude has full context.
+Add complete attachment handling to the Discord bot, matching cc-tg's patterns:
+1. **Images** → fetch as base64 → `session.claude.sendImage()`; for meta-agent channels → save to disk + ATTACHMENTS path
+2. **Documents/files** → download to `.cc-discord/uploads/` → ATTACHMENTS prompt → route to local session or meta-agent
+3. **Audio/voice** → Whisper transcription (already exists) → combine with caption → route to local session or meta-agent; detect `.wav`/`.webm`
 
-## Format
-```
-> [replying to <AuthorUsername>]: <original message content (truncated to 300 chars)>
-<user's actual reply>
-```
+## Current state
+- `handleVoice` exists: transcribes and sends to local Claude only (no meta-agent, no caption combine)
+- `handleImage` exists: fetches base64, sends to local Claude only (no meta-agent, no chat log write)
+- No document/file handling at all
+- Audio detection missing `.wav`, `.webm`, and `audio/` content-type prefix
 
-## Chosen approach: Enrich `text` in `handleMessage` before routing
-After `text` is cleaned of @mentions, check `msg.reference?.messageId`, fetch the
-referenced message, and prepend the reply prefix to `text`. This single insertion
-point naturally covers all downstream paths (meta-agent, local Claude session).
+## Approach: Extend existing handlers + new handleDocument
+
+1. **handleMessage**: add `.wav`/`.webm`/`audio/` audio detection; add doc check before text check
+2. **handleVoice**: combine transcript with caption; add meta-agent routing
+3. **handleImage**: add meta-agent routing (save to disk path); add `writeChatMessage`
+4. **handleDocument** (new): download → ATTACHMENTS prompt → meta-agent or local session
 
 ## Files to touch
-- `src/bot.ts` — add reply context enrichment in `handleMessage`
+- `src/bot.ts` — all changes above
+- `src/bot.test.ts` — new file with tests for attachment handling
 
 ## Risks
-- `messages.fetch()` may throw if the referenced message is deleted — handled with
-  try/catch (silent skip, proceed with original text)
-- Referenced message author may have no `member` in DMs — fallback to `author.username`
+- `msg.attachments.first()` returns undefined on empty collection — guard with `if (docAttachment)`
+- `crypto.randomUUID()` already used in bot.ts (safe, Node built-in)
+- `mkdirSync` already imported in bot.ts

@@ -93,6 +93,24 @@ const TYPING_INTERVAL_MS = 9000;
 
 const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
+/** Returns true if the attachment name/contentType indicates an audio file. */
+export function isAudioAttachment(name: string, contentType: string): boolean {
+  const n = name.toLowerCase();
+  const ct = contentType.toLowerCase();
+  return (
+    ct.startsWith("audio/") ||
+    n.endsWith(".ogg") || n.endsWith(".mp3") || n.endsWith(".m4a") ||
+    n.endsWith(".wav") || n.endsWith(".webm") ||
+    ct.includes("ogg") || ct.includes("mpeg") || ct.includes("mp4a")
+  );
+}
+
+/** Build the prompt text for a file/document attachment, optionally with caption. */
+export function buildAttachmentPrompt(caption: string, fileName: string, filePath: string): string {
+  const ref = `[${fileName}](${filePath})`;
+  return caption ? `${caption}\n\nATTACHMENTS: ${ref}` : `ATTACHMENTS: ${ref}`;
+}
+
 /** Prepend [DayOfWeek HH:MM] username: so Claude knows when the message was received and from whom. */
 export function stampPrompt(text: string, username?: string, now = new Date()): string {
   const day = DAYS[now.getDay()];
@@ -381,14 +399,9 @@ export class CcDiscordBot {
     this.storeSnowflake(effectiveChannelId);
 
     // Check for voice/audio attachments
-    const audioAttachment = msg.attachments.find((att) => {
-      const name = att.name?.toLowerCase() ?? "";
-      const ct = att.contentType?.toLowerCase() ?? "";
-      return (
-        name.endsWith(".ogg") || name.endsWith(".mp3") || name.endsWith(".m4a") ||
-        ct.includes("ogg") || ct.includes("mpeg") || ct.includes("mp4a")
-      );
-    });
+    const audioAttachment = msg.attachments.find((att) =>
+      isAudioAttachment(att.name ?? "", att.contentType ?? "")
+    );
 
     if (audioAttachment) {
       await this.handleVoice(msg, effectiveChannelId, audioAttachment.url, audioAttachment.name ?? "audio.ogg");
@@ -403,6 +416,13 @@ export class CcDiscordBot {
 
     if (imageAttachment) {
       await this.handleImage(msg, effectiveChannelId, imageAttachment.url, imageAttachment.contentType ?? "image/jpeg");
+      return;
+    }
+
+    // Other file/document attachments
+    const docAttachment = msg.attachments.first();
+    if (docAttachment) {
+      await this.handleDocument(msg, effectiveChannelId, docAttachment.url, docAttachment.name ?? "file");
       return;
     }
 
@@ -475,12 +495,30 @@ export class CcDiscordBot {
         return;
       }
 
-      const session = this.getOrCreateSession(channelId, channel);
-      session.currentPrompt = transcript;
+      // Combine transcript with caption text if present
+      const caption = msg.content.trim().replace(/<@!?\d+>/g, "").trim();
+      const fullText = caption ? `${caption}\n\n${transcript}` : transcript;
       const voiceUsername = msg.member?.displayName ?? msg.author.username;
-      session.claude.sendPrompt(stampPrompt(transcript, voiceUsername, msg.createdAt));
+      const prompt = stampPrompt(fullText, voiceUsername, msg.createdAt);
+
+      // Meta-agent routing
+      const mappedNs = this.channelNamespaceMap.get(channelId);
+      if (mappedNs && this.redis) {
+        this.writeChatMessage("user", "discord", fullText, channelId, mappedNs.namespace);
+        this.opts.registerRoutedChannelId?.(mappedNs.namespace, channelId);
+        try {
+          await routeToMetaAgent(mappedNs.namespace, prompt, this.redis);
+        } catch (err) {
+          await (channel as TextChannel).send(`Failed to route to ${mappedNs.namespace}: ${(err as Error).message}`).catch(() => {});
+        }
+        return;
+      }
+
+      const session = this.getOrCreateSession(channelId, channel);
+      session.currentPrompt = fullText;
+      session.claude.sendPrompt(prompt);
       this.startTyping(channelId, channel, session);
-      this.writeChatMessage("user", "discord", transcript, channelId);
+      this.writeChatMessage("user", "discord", fullText, channelId);
     } catch (err) {
       const errMsg = (err as Error).message;
       let userMsg: string;
@@ -499,15 +537,84 @@ export class CcDiscordBot {
     const channel = msg.channel as SendableChannel;
     await (channel as TextChannel).sendTyping().catch(() => {});
 
+    const caption = msg.content.trim().replace(/<@!?\d+>/g, "").trim();
+    const imgUsername = msg.member?.displayName ?? msg.author.username;
+
     try {
+      // Meta-agent routing: save to disk and send as ATTACHMENTS path reference
+      const mappedNs = this.channelNamespaceMap.get(channelId);
+      if (mappedNs && this.redis) {
+        const ext = contentType.split("/")[1]?.replace("jpeg", "jpg") ?? "jpg";
+        const fileName = `image_${crypto.randomUUID()}.${ext}`;
+        const uploadsDir = resolve(this.opts.cwd ?? process.cwd(), ".cc-discord", "uploads");
+        mkdirSync(uploadsDir, { recursive: true });
+        const dest = join(uploadsDir, fileName);
+        await downloadFile(imageUrl, dest);
+        const fullText = buildAttachmentPrompt(caption, fileName, dest);
+        const prompt = stampPrompt(fullText, imgUsername, msg.createdAt);
+        this.writeChatMessage("user", "discord", fullText, channelId, mappedNs.namespace);
+        this.opts.registerRoutedChannelId?.(mappedNs.namespace, channelId);
+        try {
+          await routeToMetaAgent(mappedNs.namespace, prompt, this.redis);
+        } catch (err) {
+          await (channel as TextChannel).send(`Failed to route to ${mappedNs.namespace}: ${(err as Error).message}`).catch(() => {});
+        }
+        return;
+      }
+
+      // Local Claude session: send as base64
       const base64Data = await fetchAsBase64(imageUrl);
-      const caption = msg.content.trim() || "";
-      const imgUsername = msg.member?.displayName ?? msg.author.username;
       const session = this.getOrCreateSession(channelId, channel);
       session.claude.sendImage(base64Data, contentType, stampPrompt(caption, imgUsername, msg.createdAt));
       this.startTyping(channelId, channel, session);
+      this.writeChatMessage("user", "discord", caption || "[image]", channelId);
     } catch (err) {
       await (channel as TextChannel).send(`Failed to process image: ${(err as Error).message}`).catch(() => {});
+    }
+  }
+
+  private async handleDocument(msg: Message, channelId: string, fileUrl: string, fileName: string): Promise<void> {
+    const channel = msg.channel as SendableChannel;
+    await (channel as TextChannel).sendTyping().catch(() => {});
+
+    const uploadsDir = resolve(this.opts.cwd ?? process.cwd(), ".cc-discord", "uploads");
+    mkdirSync(uploadsDir, { recursive: true });
+    const dest = join(uploadsDir, fileName);
+
+    try {
+      await downloadFile(fileUrl, dest);
+    } catch (err) {
+      await (channel as TextChannel).send(`Failed to download file: ${(err as Error).message}`).catch(() => {});
+      return;
+    }
+
+    const caption = msg.content.trim().replace(/<@!?\d+>/g, "").trim();
+    const fullText = buildAttachmentPrompt(caption, fileName, dest);
+    const username = msg.member?.displayName ?? msg.author.username;
+    const prompt = stampPrompt(fullText, username, msg.createdAt);
+
+    // Meta-agent routing
+    const mappedNs = this.channelNamespaceMap.get(channelId);
+    if (mappedNs && this.redis) {
+      this.writeChatMessage("user", "discord", fullText, channelId, mappedNs.namespace);
+      this.opts.registerRoutedChannelId?.(mappedNs.namespace, channelId);
+      try {
+        await routeToMetaAgent(mappedNs.namespace, prompt, this.redis);
+      } catch (err) {
+        await (channel as TextChannel).send(`Failed to route to ${mappedNs.namespace}: ${(err as Error).message}`).catch(() => {});
+      }
+      return;
+    }
+
+    // Local Claude session
+    const session = this.getOrCreateSession(channelId, channel);
+    try {
+      session.currentPrompt = fullText;
+      session.claude.sendPrompt(prompt);
+      this.startTyping(channelId, channel, session);
+      this.writeChatMessage("user", "discord", fullText, channelId);
+    } catch (err) {
+      await (channel as TextChannel).send(`Failed to process file: ${(err as Error).message}`).catch(() => {});
     }
   }
 
