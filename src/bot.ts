@@ -32,8 +32,7 @@ import { formatForDiscord, splitLongMessage, stripAnsi } from "./formatter.js";
 import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./tokens.js";
 import { writeChatLog, type ChatMessage } from "./notifier.js";
 import { CronManager } from "./cron.js";
-import { parseRoutingTag, parseChannelCreateIntent, ensureMetaAgent, routeToMetaAgent } from "./router.js";
-import { metaAgentStatusKey } from "@gonzih/cc-wire";
+import { parseChannelCreateIntent, ensureMetaAgent, routeToMetaAgent } from "./router.js";
 
 type SendableChannel = TextChannel | DMChannel | NewsChannel | ThreadChannel | VoiceChannel;
 
@@ -368,59 +367,6 @@ export class CcDiscordBot {
         await (msg.channel as TextChannel).send(`Failed to route to ${mappedNs.namespace}: ${(err as Error).message}`).catch(() => {});
       }
       return;
-    }
-
-    // #tag / #org/repo routing — delegate to meta-agent
-    if (this.redis) {
-      const routing = parseRoutingTag(text);
-      if (routing) {
-        const channel = msg.channel as SendableChannel;
-        await (channel as TextChannel).send(`→ #${routing.namespace}`).catch(() => {});
-        this.writeChatMessage("user", "discord", text, effectiveChannelId);
-        this.opts.registerRoutedChannelId?.(routing.namespace, effectiveChannelId);
-        try {
-          await ensureMetaAgent(
-            routing.namespace,
-            routing.repoUrl,
-            (toolName, args) => this.callCcAgentTool(toolName, args ?? {}),
-            this.redis
-          );
-          await routeToMetaAgent(routing.namespace, routing.strippedMessage, this.redis);
-        } catch (err) {
-          await (channel as TextChannel).send(`Failed to route to #${routing.namespace}: ${(err as Error).message}`).catch(() => {});
-        }
-        return;
-      }
-    }
-
-    // Channel name → meta-agent namespace routing
-    if (this.redis) {
-      const channelName = (msg.channel as TextChannel).name ?? "";
-      if (channelName && channelName !== "general") {
-        // Check if a meta-agent is running for this channel name as namespace
-        const ns = channelName.toLowerCase().replace(/[^a-z0-9-]/g, "-");
-        try {
-          const statusRaw = await this.redis.get(metaAgentStatusKey(ns));
-          if (statusRaw) {
-            const status = JSON.parse(statusRaw) as { status?: string };
-            if (status.status === "running" || status.status === "idle") {
-              // Route to meta-agent
-              const channel = msg.channel as SendableChannel;
-              await (channel as TextChannel).send(`→ #${ns} (meta-agent)`).catch(() => {});
-              this.writeChatMessage("user", "discord", text, effectiveChannelId);
-              this.opts.registerRoutedChannelId?.(ns, effectiveChannelId);
-              try {
-                await routeToMetaAgent(ns, text, this.redis);
-              } catch (err) {
-                await (channel as TextChannel).send(`Failed to route to #${ns}: ${(err as Error).message}`).catch(() => {});
-              }
-              return;
-            }
-          }
-        } catch {
-          // Redis error — fall through to local session
-        }
-      }
     }
 
     // Local Claude session
