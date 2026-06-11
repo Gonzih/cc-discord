@@ -19,10 +19,14 @@
  *   DEFAULT_GITHUB_ORG         — default GitHub org for #repo routing (default: gonzih)
  */
 
+import { createRequire } from "node:module";
 import { Redis } from "ioredis";
 import { CcDiscordBot } from "./bot.js";
 import { startNotifier } from "./notifier.js";
 import { loadTokens } from "./tokens.js";
+
+const require = createRequire(import.meta.url);
+const { version } = require("../package.json") as { version: string };
 
 function required(name: string): string {
   const val = process.env[name];
@@ -82,10 +86,10 @@ sharedRedis.on("error", (err: Error) => {
 });
 sharedRedis.once("ready", () => {
   // Announce this version on Redis so other services can discover cc-discord
-  sharedRedis.set(`cca:meta:cc-discord:version`, "0.1.0").catch((err: Error) => {
+  sharedRedis.set(`cca:meta:cc-discord:version`, version).catch((err: Error) => {
     console.warn("[redis] failed to write version:", err.message);
   });
-  console.log("[cc-discord] version:reported 0.1.0");
+  console.log(`[cc-discord] version:reported ${version}`);
 });
 
 // Mutable placeholder closures — filled in once `bot` is created below
