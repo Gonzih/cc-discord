@@ -266,12 +266,9 @@ export function startNotifier(
     const content = parsed.content;
     if (!content) return;
 
-    // For the primary namespace, fall back to notifyChannelId / getActiveChannelId.
-    // For any other namespace, ONLY use the registered channelId — never fall back to
-    // the primary channel, as that would cause cross-namespace leakage.
-    const targetChannelId = ns === namespace
-      ? (routedChannelIds.get(ns) ?? notifyChannelId ?? getActiveChannelId?.())
-      : routedChannelIds.get(ns);
+    // Only forward to Discord for explicitly routed namespaces.
+    // Primary namespace (money-brain) chat output belongs to Telegram — cc-tg handles that.
+    const targetChannelId = routedChannelIds.get(ns);
 
     if (targetChannelId == null) {
       log("warn", `meta-agent output: no channelId for namespace=${ns}, dropping line`);
