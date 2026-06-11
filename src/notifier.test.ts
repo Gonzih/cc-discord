@@ -150,7 +150,7 @@ describe("startNotifier — pmessage (cca:chat:outgoing:*)", () => {
     vi.useRealTimers();
   });
 
-  it("does NOT forward primary namespace meta-agent output to Discord", async () => {
+  it("forwards primary namespace meta-agent output to the primary Discord notify channel", async () => {
     vi.useFakeTimers();
     const { mockBot, mockSub, mockRedis, sent } = buildMocks();
 
@@ -166,8 +166,9 @@ describe("startNotifier — pmessage (cca:chat:outgoing:*)", () => {
 
     await vi.advanceTimersByTimeAsync(2_000);
 
-    // Primary namespace chat output must NOT reach Discord
-    expect(sent).toHaveLength(0);
+    // Primary namespace chat output now goes to BOTH Telegram (via cc-tg) AND Discord (via notifyChannelId)
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ channelId: "primary-notify-ch" });
   });
 
   it("forwards routed namespace meta-agent output to the registered Discord channel", async () => {

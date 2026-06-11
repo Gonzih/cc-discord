@@ -267,9 +267,11 @@ export function startNotifier(
     const content = parsed.content;
     if (!content) return;
 
-    // Only forward to Discord for explicitly routed namespaces.
-    // Primary namespace (money-brain) chat output belongs to Telegram — cc-tg handles that.
-    const targetChannelId = routedChannelIds.get(ns);
+    // For the primary namespace: deliver to the primary Discord channel (DISCORD_NOTIFY_CHANNEL_ID
+    // or the last-active channel). Responses go to BOTH Telegram (via cc-tg) AND Discord.
+    // For other (routed) namespaces: only deliver to explicitly registered channelIds.
+    const targetChannelId = routedChannelIds.get(ns) ??
+      (ns === namespace ? (notifyChannelId ?? getActiveChannelId?.()) : undefined);
 
     if (targetChannelId == null) {
       log("warn", `meta-agent output: no channelId for namespace=${ns}, dropping line`);
