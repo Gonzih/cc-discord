@@ -531,11 +531,12 @@ export class CcDiscordBot {
       const caption = msg.content.trim().replace(/<@!?\d+>/g, "").trim();
       const fullText = caption ? `${caption}\n\n${transcript}` : transcript;
       const voiceUsername = msg.member?.displayName ?? msg.author.username;
-      const prompt = stampPrompt(fullText, voiceUsername, msg.createdAt);
 
       // Meta-agent routing
       const mappedNs = this.channelNamespaceMap.get(channelId);
       if (mappedNs && this.redis) {
+        const labeledText = `[voice note — transcription may contain typos]: ${fullText}`;
+        const prompt = stampPrompt(labeledText, voiceUsername, msg.createdAt);
         this.writeChatMessage("user", "discord", fullText, channelId, mappedNs.namespace);
         this.opts.registerRoutedChannelId?.(mappedNs.namespace, channelId);
         this.persistChannelMapping(channelId, mappedNs.namespace, mappedNs.repoUrl);
@@ -550,7 +551,7 @@ export class CcDiscordBot {
 
       const session = this.getOrCreateSession(channelId, channel);
       session.currentPrompt = fullText;
-      session.claude.sendPrompt(prompt);
+      session.claude.sendPrompt(stampPrompt(fullText, voiceUsername, msg.createdAt));
       this.startTyping(channelId, channel, session);
       this.writeChatMessage("user", "discord", fullText, channelId);
     } catch (err) {
