@@ -27,20 +27,17 @@ import { resolve, basename, join } from "path";
 import https from "https";
 import http from "http";
 import { Redis } from "ioredis";
+import { createCcWire } from "@gonzih/cc-wire";
 import { ClaudeProcess, extractText, ClaudeMessage, UsageEvent } from "./claude.js";
 import { transcribeVoice, isVoiceAvailable } from "./voice.js";
 import { formatForDiscord, splitLongMessage, stripAnsi } from "./formatter.js";
 import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./tokens.js";
 import { writeChatLog, type ChatMessage } from "./notifier.js";
 import { CronManager } from "./cron.js";
-import { parseChannelCreateIntent, ensureMetaAgent, routeToMetaAgent } from "./router.js";
+import { parseChannelCreateIntent, routeToMetaAgent } from "./router.js";
+import { createMetaAgentManager, type MetaAgentManager } from "./meta-agent-manager.js";
 
 type SendableChannel = TextChannel | DMChannel | NewsChannel | ThreadChannel | VoiceChannel;
-
-/** Redis key for persisting a Discord channelId → namespace mapping across restarts. */
-function discordChannelKey(channelId: string): string {
-  return `cca:discord:channel:${channelId}`;
-}
 
 /** Convert a Discord snowflake string to a safe 53-bit integer for CronManager compatibility. */
 function snowflakeToInt(id: string): number {
@@ -193,9 +190,11 @@ export class CcDiscordBot {
   private costs = new Map<string, SessionCost>();
   private opts: DiscordBotOptions;
   private redis?: Redis;
+  private wire?: ReturnType<typeof createCcWire>;
   private namespace: string;
   private lastActiveChannelId?: string;
   private cron: CronManager;
+  private metaAgentManager: MetaAgentManager;
   /** ClaudeProcess running the MCP tool bridge (for callCcAgentTool) */
   private mcpSession?: ClaudeProcess;
 
@@ -203,6 +202,10 @@ export class CcDiscordBot {
     this.opts = opts;
     this.redis = opts.redis;
     this.namespace = opts.namespace ?? "default";
+    if (opts.redis) {
+      this.wire = createCcWire(opts.redis);
+    }
+    this.metaAgentManager = createMetaAgentManager();
 
     this.client = new Client({
       intents: [
@@ -271,12 +274,10 @@ export class CcDiscordBot {
     return this.snowflakeMap.get(n);
   }
 
-  /** Persist a channelId → {namespace, repoUrl} mapping to Redis. */
+  /** Persist a channelId → {namespace, repoUrl} mapping to Redis via wire.discord. */
   private persistChannelMapping(channelId: string, namespace: string, repoUrl: string): void {
-    if (!this.redis) return;
-    const key = discordChannelKey(channelId);
-    const value = JSON.stringify({ namespace, repoUrl });
-    this.redis.set(key, value).catch((err: Error) => {
+    if (!this.wire) return;
+    this.wire.discord.registerChannel(channelId, namespace, repoUrl).catch((err: Error) => {
       console.warn(`[bot] persistChannelMapping failed for ${channelId}:`, err.message);
     });
   }
@@ -286,27 +287,19 @@ export class CcDiscordBot {
    * channelNamespaceMap + routedChannelIds. Call once on startup after the notifier is ready.
    */
   public async loadChannelMappings(): Promise<void> {
-    if (!this.redis) return;
-    let keys: string[];
+    if (!this.wire) return;
+    let channels: Array<{ channelId: string; namespace: string; repoUrl: string }>;
     try {
-      keys = await this.redis.keys("cca:discord:channel:*");
+      channels = await this.wire.discord.listChannels();
     } catch (err) {
-      console.warn("[bot] loadChannelMappings keys scan failed:", (err as Error).message);
+      console.warn("[bot] loadChannelMappings failed:", (err as Error).message);
       return;
     }
-    for (const key of keys) {
-      try {
-        const raw = await this.redis.get(key);
-        if (!raw) continue;
-        const { namespace, repoUrl } = JSON.parse(raw) as { namespace: string; repoUrl: string };
-        const channelId = key.slice("cca:discord:channel:".length);
-        if (!this.channelNamespaceMap.has(channelId)) {
-          this.channelNamespaceMap.set(channelId, { namespace, repoUrl });
-          this.opts.registerRoutedChannelId?.(namespace, channelId);
-          console.log(`[bot] restored channel mapping: ${channelId} → ${namespace}`);
-        }
-      } catch (err) {
-        console.warn(`[bot] loadChannelMappings: failed to parse ${key}:`, (err as Error).message);
+    for (const { channelId, namespace, repoUrl } of channels) {
+      if (!this.channelNamespaceMap.has(channelId)) {
+        this.channelNamespaceMap.set(channelId, { namespace, repoUrl });
+        this.opts.registerRoutedChannelId?.(namespace, channelId);
+        console.log(`[bot] restored channel mapping: ${channelId} → ${namespace}`);
       }
     }
   }
@@ -985,14 +978,16 @@ export class CcDiscordBot {
           this.opts.registerRoutedChannelId?.(namespace, newChannel.id);
           this.persistChannelMapping(newChannel.id, namespace, repoUrl);
           await interaction.editReply(`Created <#${newChannel.id}> — messages there route to the ${repoUrl} meta-agent`);
-          // Start meta-agent in the background
-          if (this.redis) {
-            ensureMetaAgent(namespace, repoUrl, (toolName, args) => this.callCcAgentTool(toolName, args ?? {}), this.redis)
-              .catch((err: Error) => {
-                console.error(`[bot] /channel ensureMetaAgent(${namespace}) failed:`, err.message);
-                this.sendToChannelById(newChannel.id, `Warning: meta-agent startup failed — ${err.message}`).catch(() => {});
-              });
-          }
+          // Clone workspace and inject MCP config in the background
+          this.metaAgentManager.ensureWorkspace(namespace, repoUrl)
+            .then(async () => {
+              const token = await this.resolveToken();
+              this.metaAgentManager.injectMcp(namespace, token);
+            })
+            .catch((err: Error) => {
+              console.error(`[bot] /channel workspace setup(${namespace}) failed:`, err.message);
+              this.sendToChannelById(newChannel.id, `Warning: workspace setup failed — ${err.message}`).catch(() => {});
+            });
         } catch (err) {
           await interaction.editReply(`Failed to create channel: ${(err as Error).message}`);
         }
@@ -1137,14 +1132,16 @@ export class CcDiscordBot {
     this.opts.registerRoutedChannelId?.(namespace, newChannel.id);
     this.persistChannelMapping(newChannel.id, namespace, repoUrl);
     await (channel as TextChannel).send(`Created <#${newChannel.id}> — messages there route to the ${repoUrl} meta-agent`).catch(() => {});
-    // Start meta-agent in the background after acknowledging the user
-    if (this.redis) {
-      ensureMetaAgent(namespace, repoUrl, (toolName, args) => this.callCcAgentTool(toolName, args ?? {}), this.redis)
-        .catch((err: Error) => {
-          console.error(`[bot] ensureMetaAgent(${namespace}) failed:`, err.message);
-          this.sendToChannelById(newChannel.id, `Warning: meta-agent startup failed — ${err.message}`).catch(() => {});
-        });
-    }
+    // Clone workspace and inject MCP config in the background after acknowledging the user
+    this.metaAgentManager.ensureWorkspace(namespace, repoUrl)
+      .then(async () => {
+        const token = await this.resolveToken();
+        this.metaAgentManager.injectMcp(namespace, token);
+      })
+      .catch((err: Error) => {
+        console.error(`[bot] workspace setup(${namespace}) failed:`, err.message);
+        this.sendToChannelById(newChannel.id, `Warning: workspace setup failed — ${err.message}`).catch(() => {});
+      });
   }
 
   /** Write a message to the Redis chat log. Fire-and-forget.
@@ -1205,6 +1202,36 @@ export class CcDiscordBot {
     }
   }
 
+  /** Resolve the current claude token from wire master or env fallbacks. */
+  public async resolveToken(): Promise<string> {
+    if (this.wire) {
+      try {
+        return await this.wire.token.getMaster();
+      } catch {
+        // master token not set — fall through to env vars
+      }
+    }
+    return (
+      this.opts.claudeToken ??
+      process.env.CLAUDE_CODE_OAUTH_TOKEN ??
+      process.env.CLAUDE_CODE_TOKEN ??
+      process.env.ANTHROPIC_API_KEY ??
+      ""
+    );
+  }
+
+  /**
+   * Start the meta-agent polling loop.
+   * Called from index.ts after startup migrations complete.
+   * Passes a live getter for the set of registered namespaces.
+   */
+  public startMetaAgentPolling(): void {
+    if (!this.wire) return;
+    this.metaAgentManager.startPolling(this.wire, () =>
+      Array.from(this.channelNamespaceMap.values()).map((v) => v.namespace)
+    );
+  }
+
   public stop(): void {
     for (const [key, session] of this.sessions) {
       if (session.flushTimer) clearTimeout(session.flushTimer);
@@ -1215,6 +1242,7 @@ export class CcDiscordBot {
     for (const [channelId] of this.metaAgentTypingTimers) {
       this.stopMetaAgentTyping(channelId);
     }
+    this.metaAgentManager.stop();
     void this.client.destroy();
   }
 }

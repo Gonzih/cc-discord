@@ -1,25 +1,24 @@
 /**
  * DiscordNotifier — subscribes to Redis pub/sub channels and bridges messages to Discord.
  *
- * Channels:
- *   cca:notify:{namespace}        — job completion notifications from cc-agent → forward to DISCORD_NOTIFY_CHANNEL_ID
- *   cca:chat:incoming:{namespace} — messages from the web UI → echo to Discord + feed into Claude session
- *   cca:chat:outgoing:*           — meta-agent stdout lines (source=claude) → buffer+debounce → Discord
+ * v0.2.0 channels (discord-scoped):
+ *   cca:discord:notify:{ns}              — job completion notifications → forward to Discord channel
+ *   cca:chat:incoming:{ns}              — messages from the web UI → echo to Discord + feed to meta-agent
+ *   cca:discord:chat:outgoing:{ns}      — meta-agent stdout lines (source=claude) → buffer+debounce → Discord
  *
  * All messages (Discord incoming, Claude responses) are also written to:
- *   cca:chat:log:{namespace}      — LPUSH + LTRIM 0 499 (last 500 messages)
- *   cca:chat:outgoing:{namespace} — PUBLISH for web UI to consume
+ *   cca:discord:chat:log:{ns}           — LPUSH + LTRIM 0 499 (last 500 messages)
+ *   cca:discord:chat:outgoing:{ns}      — PUBLISH for web UI to consume
  */
 
 import { Redis } from "ioredis";
 import {
-  chatLogKey,
-  chatOutgoingChannel,
+  discordChatLog,
+  discordChatOutgoing,
+  discordNotify,
   chatIncomingChannel,
-  notifyChannel,
-  notifyListKey,
-  metaAgentStatusKey,
-  metaInputKey,
+  createCcWire,
+  TIMING,
   type NotificationPayload,
   type Transport,
 } from "@gonzih/cc-wire";
@@ -95,6 +94,7 @@ export function parseNotification(raw: string): ParsedNotification | null {
 
 /**
  * Write a message to the chat log in Redis.
+ * Uses discord-scoped keys (cca:discord:chat:log:{ns}, cca:discord:chat:outgoing:{ns}).
  * Fire-and-forget — errors are logged but not thrown.
  */
 export function writeChatLog(
@@ -102,8 +102,8 @@ export function writeChatLog(
   namespace: string,
   msg: ChatMessage
 ): void {
-  const logKey = chatLogKey(namespace);
-  const outKey = chatOutgoingChannel(namespace);
+  const logKey = discordChatLog(namespace);
+  const outKey = discordChatOutgoing(namespace);
   const payload = JSON.stringify(msg);
   redis.lpush(logKey, payload).catch((err: Error) => {
     log("warn", "writeChatLog lpush failed:", err.message);
@@ -139,7 +139,7 @@ export interface NotifierHandle {
    * Register the originating Discord channel ID for a routed namespace.
    * When the meta-agent for `namespace` publishes a response, it will be
    * forwarded to `channelId`.
-   * Also subscribes to notifyChannel(namespace) and chatIncomingChannel(namespace)
+   * Also subscribes to discordNotify(namespace) and chatIncomingChannel(namespace)
    * so notifications and UI messages for that namespace are received.
    */
   registerRoutedChannelId: (namespace: string, channelId: string) => void;
@@ -150,7 +150,7 @@ export interface NotifierHandle {
  *
  * @param bot                     - CcDiscordBot instance (for sending messages)
  * @param notifyChannelId         - Discord channel ID to forward notifications to. Pass null to use getActiveChannelId.
- * @param namespace               - cc-agent namespace (used to build Redis channel names)
+ * @param namespace               - primary namespace (used to build Redis channel names)
  * @param redis                   - ioredis client in normal mode (will be duplicated for pub/sub)
  * @param handleUserMessage       - Optional callback to feed UI messages into the active Claude session
  * @param forwardNotification     - Optional callback to forward job notifications
@@ -167,6 +167,8 @@ export function startNotifier(
   getActiveChannelId?: () => string | undefined,
   reverseSnowflakeLookup?: (n: number) => string | undefined
 ): NotifierHandle {
+  const wire = createCcWire(redis);
+
   // Per-namespace channelId registry — maps routed namespace → Discord channelId
   const routedChannelIds = new Map<string, string>();
   // Track which namespaces we've already subscribed to (to avoid duplicate subscribe calls)
@@ -195,7 +197,7 @@ export function startNotifier(
     if (subscribedNamespaces.has(ns)) return;
     subscribedNamespaces.add(ns);
 
-    const notifyCh = notifyChannel(ns);
+    const notifyCh = discordNotify(ns);
     const incomingCh = chatIncomingChannel(ns);
     channelToNamespace.set(notifyCh, ns);
     channelToNamespace.set(incomingCh, ns);
@@ -224,17 +226,20 @@ export function startNotifier(
   // Subscribe to the primary namespace immediately
   subscribeNamespace(namespace);
 
-  // chatOutgoingChannel("*") — meta-agent stdout lines for ALL namespaces
-  sub.psubscribe(chatOutgoingChannel("*"), (err) => {
+  // discordChatOutgoing("*") — meta-agent stdout lines for ALL discord namespaces
+  const outgoingPattern = discordChatOutgoing("*");
+  // Prefix to strip when extracting namespace from a matched channel name
+  const outgoingPrefix = discordChatOutgoing("");
+
+  sub.psubscribe(outgoingPattern, (err) => {
     if (err) {
-      log("error", `psubscribe ${chatOutgoingChannel("*")} failed:`, err.message);
+      log("error", `psubscribe ${outgoingPattern} failed:`, err.message);
     } else {
-      log("info", `psubscribed to ${chatOutgoingChannel("*")}`);
+      log("info", `psubscribed to ${outgoingPattern}`);
     }
   });
 
-  // 1.5s silence buffer for meta-agent streaming
-  const META_AGENT_FLUSH_DELAY_MS = 1500;
+  // Buffer for meta-agent streaming output — debounced before sending to Discord
   const metaAgentBuffers = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> | null }>();
 
   function flushMetaAgentBuffer(ns: string, targetChannelId: string): void {
@@ -254,7 +259,7 @@ export function startNotifier(
 
   sub.on("pmessage", (pattern: string, channel: string, message: string) => {
     void pattern;
-    const ns = channel.slice(chatOutgoingChannel("").length);
+    const ns = channel.slice(outgoingPrefix.length);
 
     let parsed: { source?: string; content?: string } | null = null;
     try {
@@ -267,8 +272,7 @@ export function startNotifier(
     const content = parsed.content;
     if (!content) return;
 
-    // For the primary namespace: deliver to the primary Discord channel (DISCORD_NOTIFY_CHANNEL_ID
-    // or the last-active channel). Responses go to BOTH Telegram (via cc-tg) AND Discord.
+    // For the primary namespace: deliver to the primary Discord channel.
     // For other (routed) namespaces: only deliver to explicitly registered channelIds.
     const targetChannelId = routedChannelIds.get(ns) ??
       (ns === namespace ? (notifyChannelId ?? getActiveChannelId?.()) : undefined);
@@ -285,14 +289,17 @@ export function startNotifier(
     }
     buf.text += (buf.text ? "\n" : "") + content;
     if (buf.timer) clearTimeout(buf.timer);
-    buf.timer = setTimeout(() => flushMetaAgentBuffer(ns, targetChannelId), META_AGENT_FLUSH_DELAY_MS);
+    buf.timer = setTimeout(
+      () => flushMetaAgentBuffer(ns, targetChannelId),
+      TIMING.META_AGENT_FLUSH_DELAY_MS
+    );
   });
 
-  // Poll notifyListKey(ns) LIST every 5 seconds — covers primary + all routed namespaces.
+  // Poll discordNotify(ns) LIST every 5 seconds — covers primary + all routed namespaces.
   const MAX_PER_CYCLE = 20;
 
   const pollOneNamespace = async (ns: string, targetChannelId: string): Promise<void> => {
-    const listKey = notifyListKey(ns);
+    const listKey = discordNotify(ns);
     const items: string[] = [];
     try {
       for (let i = 0; i < MAX_PER_CYCLE; i++) {
@@ -363,7 +370,7 @@ export function startNotifier(
     if (!ns) return;
 
     const isPrimary = ns === namespace;
-    const notifyCh = notifyChannel(ns);
+    const notifyCh = discordNotify(ns);
     const incomingCh = chatIncomingChannel(ns);
 
     if (channel === notifyCh) {
@@ -419,30 +426,32 @@ export function startNotifier(
           role: "user",
           content,
           timestamp: originalTimestamp ?? new Date().toISOString(),
-          chatId: 0, // no numeric chatId for Discord — stored by channelId string
+          chatId: 0,
         };
         writeChatLog(redis, ns, inMsg);
 
-        // Check if a meta-agent is running; if so, route there instead
+        // Route to meta-agent input queue if this namespace has a registered session;
+        // otherwise fall through to handleUserMessage (local Claude session).
         void (async () => {
           let routedToMetaAgent = false;
-          try {
-            const statusRaw = await redis.get(metaAgentStatusKey(ns));
-            if (statusRaw) {
-              const status = JSON.parse(statusRaw) as { status?: string };
-              if (status.status === "running") {
-                const entry = JSON.stringify({
+
+          if (routedChannelIds.has(ns)) {
+            try {
+              const status = await wire.discord.getStatus(ns);
+              if (status && (status.status === "running" || status.status === "idle")) {
+                await wire.discord.enqueue(ns, {
                   id: crypto.randomUUID(),
+                  source: "ui",
+                  role: "user",
                   content,
                   timestamp: new Date().toISOString(),
                 });
-                await redis.rpush(metaInputKey(ns), entry);
                 log("info", `cca:chat:incoming: routed to meta-agent for namespace ${ns}`);
                 routedToMetaAgent = true;
               }
+            } catch (err) {
+              log("warn", `meta-agent status check failed (ns=${ns}):`, (err as Error).message);
             }
-          } catch (err) {
-            log("warn", `meta-agent status check failed (ns=${ns}):`, (err as Error).message);
           }
 
           if (!routedToMetaAgent && handleUserMessage) {

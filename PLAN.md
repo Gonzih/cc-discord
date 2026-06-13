@@ -1,44 +1,66 @@
-# Plan: Typing indicator when routing to meta-agent
+# Plan: cc-discord v0.2.0 — owns meta-agent runtime directly
 
 ## Task
-When a Discord message is routed to a meta-agent via `routeToMetaAgent`, the channel shows
-no typing indicator while the agent works. The user sees silence until the response arrives.
-Fix: start a repeating typing indicator on the Discord channel when routing to a meta-agent,
-and stop it when `flushMetaAgentBuffer` fires in the notifier.
+cc-discord takes over meta-agent process management from cc-agent. It clones repos, spawns
+`claude --continue` sessions, polls input queues, and publishes output. cc-agent is no longer
+involved in meta-agent lifecycle. Upgrade cc-wire to 0.3.0, use discord-scoped Redis keys,
+and deliver a new `MetaAgentManager` module.
 
 ## Approach
 
-The meta-agent path involves two components:
-- `bot.ts` — receives the message, calls `routeToMetaAgent` to RPUSH to Redis
-- `notifier.ts` — listens for `cca:chat:outgoing:{ns}` pmessage events, buffers chunks,
-  and flushes to Discord after 1500ms silence via `flushMetaAgentBuffer`
+Use cc-wire 0.3.0 key builders (`discordMetaInputKey`, `discordChatOutgoing`, `discordNotify`,
+`discordChatLog`) and the `createCcWire(redis)` factory directly — no abstract wrapper.
+The factory provides `wire.discord.*`, `wire.tg.*`, `wire.jobs.*`, `wire.token.*` methods.
 
-The `bot` instance is already in scope inside `startNotifier` (first parameter), so the
-notifier can call methods on it directly — no new callbacks needed.
+### Key API discoveries
+- `wire.discord.enqueue(ns, msg)` → RPUSH to `cca:discord:meta:{ns}:input`
+- `wire.discord.dequeue(ns)` → RPOP from same
+- `wire.discord.publishOutgoing(ns, msg)` → PUBLISH + LPUSH to `cca:discord:chat:outgoing:{ns}`
+- `wire.discord.setStatus(ns, status)` → SET `cca:discord:meta:{ns}:status`
+- `wire.discord.getStatus(ns)` → GET same
+- `wire.discord.registerChannel(channelId, ns, repoUrl)` → HSET (replaces old STRING approach)
+- `wire.discord.listChannels()` → list all channels from HSET+SET
+- `wire.discord.pollNotify(ns)` → RPOP `cca:discord:notify:{ns}`
+- `wire.token.getMaster()` / `wire.token.setMaster(token)` → master claude token
 
-### Implementation
+### Channel key migration
+Old format: `cca:discord:channel:{channelId}` → STRING JSON `{namespace, repoUrl}`
+New format: `cca:discord:channel:{channelId}` → HASH with `namespace`, `repoUrl` fields + index SET
 
-**bot.ts:**
-1. Add `metaAgentTypingTimers: Map<string, ReturnType<typeof setInterval>>` private field
-2. Add private `startMetaAgentTyping(channelId, channel)` — immediate sendTyping + 9s interval
-3. Add public `stopMetaAgentTyping(channelId)` — clears and removes the interval
-4. Call `startMetaAgentTyping` in the 4 meta-agent routing paths:
-   - `handleMessage` (before `routeToMetaAgent`)
-   - `handleVoice` (before `routeToMetaAgent`)
-   - `handleImage` (before `routeToMetaAgent`)
-   - `handleDocument` (before `routeToMetaAgent`)
-5. Update `stop()` to also clear `metaAgentTypingTimers`
+On startup: scan old STRING keys, HSET + SADD, DEL old keys.
 
-**notifier.ts:**
-1. Call `bot.stopMetaAgentTyping(targetChannelId)` at the top of `flushMetaAgentBuffer`
-   (before the early-return guard, so it always clears even if buffer is empty)
+### Meta input key migration  
+Old: `cca:meta:{ns}:input` (used by cc-agent)
+New: `cca:discord:meta:{ns}:input`
+On startup: LRANGE + RPUSH new key + DEL old key.
+
+### Redis channel name changes in notifier
+Old subscribe patterns → new patterns:
+- `cca:chat:outgoing:*` → `cca:discord:chat:outgoing:*`  
+- `cca:notify:{ns}` → `cca:discord:notify:{ns}`
+- `cca:notify:{ns}` (list) → `cca:discord:notify:{ns}`
+- `cca:chat:log:{ns}` → `cca:discord:chat:log:{ns}`
+- `cca:chat:incoming:{ns}` — NO change (`discordChatIncoming` not in v0.3.0 package)
 
 ## Files to touch
-- `src/bot.ts` — 3 new methods + 4 call sites
-- `src/notifier.ts` — 1-line addition in `flushMetaAgentBuffer`
-- `src/notifier.test.ts` — update `buildMocks()` + add flush-stops-typing test
+- `package.json` — cc-wire ^0.3.0 (already installed)
+- `src/meta-agent-manager.ts` (NEW) — ensureWorkspace, injectMcp, spawnSession, pollQueues
+- `src/router.ts` — remove ensureMetaAgent, update routeToMetaAgent to use discordMetaInputKey
+- `src/notifier.ts` — discord-scoped keys throughout, use createCcWire internally
+- `src/bot.ts` — use wire.discord.registerChannel/listChannels, remove ensureMetaAgent calls
+- `src/index.ts` — create wire, set master token, run startup migrations, start polling
+- `src/notifier.test.ts` — update key names to discord-scoped
+- `src/router.test.ts` — no change (only parseChannelCreateIntent tests)
+- `src/bot.test.ts` — no change (isAudioAttachment, buildAttachmentPrompt tests)
+
+## MCP injection
+Reads `CC_DISCORD_MCP_JSON` env var (JSON template) for full override.
+Default template uses the cc-agent MCP server pattern from money-brain/.mcp.json:
+npx -y --prefer-online @gonzih/cc-agent with CC_AGENT_NAMESPACE, CWD, token, PATH, cache.
 
 ## Risks
-- `sendTyping` can throw on closed channels — already guarded with `.catch(() => {})` everywhere
-- Typing timer would run forever if meta-agent never responds (no timeout) — acceptable for now;
-  stopMetaAgentTyping is idempotent so a later flush cleans it up
+- `discordChatIncoming` not exported in v0.3.0 — keep using `chatIncomingChannel` (legacy, still exported)
+- Redis STRING→HASH migration must run before loading channel mappings
+- Concurrent spawns per namespace: guard with `activeNamespaces: Set<string>`
+- `wire.token.getMaster()` throws if not set — guard in spawnSession, fall back to env var
+- `claude --continue -p "..."` with `--output-format text` streams text to stdout line by line
