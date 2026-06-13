@@ -13,17 +13,20 @@
  *   DISCORD_GUILD_IDS          — comma-separated Discord guild/server IDs (for instant slash command registration)
  *   DISCORD_ALLOWED_USER_IDS   — comma-separated Discord user IDs to whitelist (leave empty to allow all)
  *   DISCORD_NOTIFY_CHANNEL_ID  — Discord channel ID for job notifications
- *   CC_AGENT_NAMESPACE         — cc-agent namespace (default: money-brain)
+ *   CC_AGENT_NAMESPACE         — primary namespace (default: money-brain)
  *   REDIS_URL                  — Redis connection URL (default: redis://localhost:6379)
  *   CWD                        — working directory for Claude Code (default: process.cwd())
  *   DEFAULT_GITHUB_ORG         — default GitHub org for #repo routing (default: gonzih)
+ *   CC_DISCORD_MCP_JSON        — JSON template for .mcp.json injection into workspaces
  */
 
 import { createRequire } from "node:module";
 import { Redis } from "ioredis";
+import { createCcWire } from "@gonzih/cc-wire";
 import { CcDiscordBot } from "./bot.js";
 import { startNotifier } from "./notifier.js";
 import { loadTokens } from "./tokens.js";
+import { migrateMetaInputKeys } from "./meta-agent-manager.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
@@ -84,13 +87,64 @@ const sharedRedis = new Redis(redisUrl);
 sharedRedis.on("error", (err: Error) => {
   console.warn("[redis] connection error:", err.message);
 });
+
+// cc-wire factory
+const wire = createCcWire(sharedRedis);
+
 sharedRedis.once("ready", () => {
-  // Announce this version on Redis so other services can discover cc-discord
+  // Announce version
   sharedRedis.set(`cca:meta:cc-discord:version`, version).catch((err: Error) => {
     console.warn("[redis] failed to write version:", err.message);
   });
   console.log(`[cc-discord] version:reported ${version}`);
+
+  // Store master token so MetaAgentManager can retrieve it
+  wire.token.setMaster(claudeToken!).catch((err: Error) => {
+    console.warn("[cc-discord] failed to set master token:", err.message);
+  });
+
+  // Run startup migrations (async, best-effort)
+  void runStartupMigrations();
 });
+
+/**
+ * Migrate old Redis data formats to the v0.2.0 layout.
+ * Runs once per startup.
+ */
+async function runStartupMigrations(): Promise<void> {
+  // 1. Migrate old STRING channel keys to new HSET format
+  let stringKeys: string[];
+  try {
+    stringKeys = await sharedRedis.keys("cca:discord:channel:*");
+  } catch (err) {
+    console.warn("[cc-discord] channel key scan failed:", (err as Error).message);
+    stringKeys = [];
+  }
+
+  for (const key of stringKeys) {
+    try {
+      const type = await sharedRedis.type(key);
+      if (type !== "string") continue; // already migrated or different type
+      const raw = await sharedRedis.get(key);
+      if (!raw) continue;
+      const { namespace: ns, repoUrl } = JSON.parse(raw) as { namespace: string; repoUrl: string };
+      const channelId = key.slice("cca:discord:channel:".length);
+      await wire.discord.registerChannel(channelId, ns, repoUrl);
+      await sharedRedis.del(key);
+      console.log(`[cc-discord] migrated channel key ${channelId} → HSET`);
+    } catch (err) {
+      console.warn(`[cc-discord] channel key migration failed for ${key}:`, (err as Error).message);
+    }
+  }
+
+  // 2. Migrate old meta input keys (cca:meta:{ns}:input → cca:discord:meta:{ns}:input)
+  await migrateMetaInputKeys(sharedRedis);
+
+  console.log("[cc-discord] startup migrations complete");
+
+  // 3. Start meta-agent polling now that data is migrated
+  bot.startMetaAgentPolling();
+}
 
 // Mutable placeholder closures — filled in once `bot` is created below
 let getLastActiveChannelIdFn: () => string | undefined = () => undefined;

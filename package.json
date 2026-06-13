@@ -18,7 +18,7 @@
     "dist/"
   ],
   "dependencies": {
-    "@gonzih/cc-wire": "^0.1.6",
+    "@gonzih/cc-wire": "^0.3.0",
     "discord.js": "^14.0.0",
     "ioredis": "^5.0.0"
   },

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { parseNotification, resolveNotifyChannel, startNotifier } from "./notifier.js";
-import { notifyListKey } from "@gonzih/cc-wire";
+import { discordNotify, discordChatOutgoing } from "@gonzih/cc-wire";
 
 describe("resolveNotifyChannel", () => {
   it("returns reverseSnowflakeLookup result when chatId and lookup available", () => {
@@ -140,12 +140,26 @@ function buildMocks() {
       return q.shift() ?? null;
     }),
     llen: vi.fn().mockResolvedValue(0),
+    // pipeline mock for createCcWire usage inside startNotifier
+    pipeline: vi.fn(() => ({
+      publish: vi.fn().mockReturnThis(),
+      lpush: vi.fn().mockReturnThis(),
+      ltrim: vi.fn().mockReturnThis(),
+      exec: vi.fn().mockResolvedValue([]),
+    })),
+    // wire.discord.getStatus used in chat-incoming routing
+    get: vi.fn().mockResolvedValue(null),
+    // wire.discord.enqueue used when routing to meta-agent
+    rpush: vi.fn().mockResolvedValue(1),
+    // wire.token.getMaster fallback
+    hgetall: vi.fn().mockResolvedValue(null),
+    smembers: vi.fn().mockResolvedValue([]),
   };
 
   return { mockBot, mockSub, mockRedis, sent, stoppedTyping, listQueues };
 }
 
-describe("startNotifier — pmessage (cca:chat:outgoing:*)", () => {
+describe("startNotifier — pmessage (cca:discord:chat:outgoing:*)", () => {
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -162,11 +176,10 @@ describe("startNotifier — pmessage (cca:chat:outgoing:*)", () => {
     );
 
     const msg = JSON.stringify({ source: "claude", content: "cron response" });
-    mockSub.emit("pmessage", "cca:chat:outgoing:*", "cca:chat:outgoing:money-brain", msg);
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), msg);
 
     await vi.advanceTimersByTimeAsync(2_000);
 
-    // Primary namespace chat output now goes to BOTH Telegram (via cc-tg) AND Discord (via notifyChannelId)
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({ channelId: "primary-notify-ch" });
   });
@@ -185,7 +198,7 @@ describe("startNotifier — pmessage (cca:chat:outgoing:*)", () => {
     handle.registerRoutedChannelId("simorgh", "discord-ch-555");
 
     const msg = JSON.stringify({ source: "claude", content: "routed response" });
-    mockSub.emit("pmessage", "cca:chat:outgoing:*", "cca:chat:outgoing:simorgh", msg);
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("simorgh"), msg);
 
     await vi.advanceTimersByTimeAsync(2_000);
 
@@ -207,7 +220,7 @@ describe("startNotifier — pmessage (cca:chat:outgoing:*)", () => {
     handle.registerRoutedChannelId("simorgh", "discord-ch-888");
 
     const msg = JSON.stringify({ source: "claude", content: "agent reply" });
-    mockSub.emit("pmessage", "cca:chat:outgoing:*", "cca:chat:outgoing:simorgh", msg);
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("simorgh"), msg);
 
     await vi.advanceTimersByTimeAsync(2_000);
 
@@ -220,11 +233,11 @@ describe("startNotifier — per-namespace list polling", () => {
     vi.useRealTimers();
   });
 
-  it("polls notifyListKey for routed namespaces after registerRoutedChannelId", async () => {
+  it("polls discordNotify list for routed namespaces after registerRoutedChannelId", async () => {
     vi.useFakeTimers();
     const { mockBot, mockRedis, sent, listQueues } = buildMocks();
 
-    const routedListKey = notifyListKey("simorgh");
+    const routedListKey = discordNotify("simorgh");
     listQueues.set(routedListKey, [JSON.stringify({ text: "job done" })]);
 
     const handle = startNotifier(
@@ -246,7 +259,7 @@ describe("startNotifier — per-namespace list polling", () => {
     vi.useFakeTimers();
     const { mockBot, mockRedis, sent, listQueues } = buildMocks();
 
-    const routedListKey = notifyListKey("simorgh");
+    const routedListKey = discordNotify("simorgh");
     listQueues.set(routedListKey, [JSON.stringify({ text: "simorgh update" })]);
 
     const handle = startNotifier(
@@ -269,7 +282,7 @@ describe("startNotifier — per-namespace list polling", () => {
     vi.useFakeTimers();
     const { mockBot, mockRedis, sent, listQueues } = buildMocks();
 
-    const primaryListKey = notifyListKey("money-brain");
+    const primaryListKey = discordNotify("money-brain");
     listQueues.set(primaryListKey, [JSON.stringify({ text: "primary done" })]);
 
     startNotifier(
@@ -288,7 +301,7 @@ describe("startNotifier — per-namespace list polling", () => {
     vi.useFakeTimers();
     const { mockBot, mockRedis, sent, listQueues } = buildMocks();
 
-    const routedListKey = notifyListKey("simorgh");
+    const routedListKey = discordNotify("simorgh");
     listQueues.set(routedListKey, [JSON.stringify({ text: "telegram only", routing: ["telegram"] })]);
 
     const handle = startNotifier(
