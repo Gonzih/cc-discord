@@ -29,7 +29,7 @@ import type { CcDiscordBot } from "./bot.js";
 
 export interface ChatMessage {
   id: string;
-  source: "discord" | "ui" | "claude" | "cc-tg";
+  source: "discord" | "ui" | "claude" | "cc-tg" | "cc-discord";
   role: "user" | "assistant" | "tool";
   content: string;
   timestamp: string;
@@ -56,6 +56,7 @@ function shortenModelName(model: string, driver: string): string {
 export interface ParsedNotification {
   text: string;
   chatId?: number;
+  isCron: boolean;
   /** Populated when the notification JSON contains an `eval_report` object. */
   evalReport?: EvalReport;
 }
@@ -73,8 +74,9 @@ export function parseNotification(raw: string): ParsedNotification | null {
   let model: string | undefined;
   let cost: number | undefined;
   let chatId: number | undefined;
+  let isCron = false;
   try {
-    const parsed = JSON.parse(raw) as NotificationPayload;
+    const parsed = JSON.parse(raw) as NotificationPayload & { is_cron?: boolean };
     // routing: absent/empty → all transports; non-empty → only listed transports
     if (parsed.routing && parsed.routing.length > 0 && !parsed.routing.includes("discord" as Transport)) {
       return null;
@@ -84,19 +86,20 @@ export function parseNotification(raw: string): ParsedNotification | null {
     model = parsed.model;
     if (typeof parsed.cost === "number") cost = parsed.cost;
     if (typeof parsed.chat_id === "number" && parsed.chat_id !== 0) chatId = parsed.chat_id;
+    if (typeof parsed.is_cron === "boolean") isCron = parsed.is_cron;
   } catch {
-    return { text };
+    return { text, isCron };
   }
 
   // Parse eval_report if present — this field is non-standard and not in NotificationPayload type
   const evalReport = parseEvalReport(raw);
 
-  if (!driver) return { text, chatId, evalReport: evalReport ?? undefined };
+  if (!driver) return { text, chatId, isCron, evalReport: evalReport ?? undefined };
 
   const shortModel = shortenModelName(model ?? "", driver);
   const badge = shortModel ? `${driver}:${shortModel}` : driver;
   const costStr = cost != null ? ` cost: $${cost.toFixed(3)}` : "";
-  return { text: `${text}\n[${badge}]${costStr}`, chatId, evalReport: evalReport ?? undefined };
+  return { text: `${text}\n[${badge}]${costStr}`, chatId, isCron, evalReport: evalReport ?? undefined };
 }
 
 /**
@@ -373,8 +376,8 @@ export function startNotifier(
       bot.sendToChannelById(destChannelId, notification.text).catch((err: Error) => {
         log("warn", `notify list send failed (ns=${ns}):`, err.message);
       });
-      if (forwardNotification) {
-        forwardNotification(mainChannelId, notification.text);
+      if (!notification.isCron && handleUserMessage) {
+        handleUserMessage(mainChannelId, notification.text);
       }
     }
 
@@ -436,8 +439,8 @@ export function startNotifier(
         bot.sendToChannelById(deliverTo, notification.text).catch((err: Error) => {
           log("warn", `notify send failed (ns=${ns}):`, err.message);
         });
-        if (forwardNotification) {
-          forwardNotification(mainChannelId, notification.text);
+        if (!notification.isCron && handleUserMessage) {
+          handleUserMessage(mainChannelId, notification.text);
         }
       } else {
         log("warn", `notify: no channelId available for ns=${ns}, dropping notification`);
