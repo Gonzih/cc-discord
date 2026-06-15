@@ -1164,6 +1164,14 @@ export class CcDiscordBot {
     return this.lastActiveChannelId;
   }
 
+  /** Reverse lookup: find the Discord channelId registered for a given namespace. */
+  public getChannelIdForNamespace(ns: string): string | undefined {
+    for (const [channelId, mapping] of this.channelNamespaceMap) {
+      if (mapping.namespace === ns) return channelId;
+    }
+    return undefined;
+  }
+
   /**
    * Feed a text message into the active Claude session for the given channel.
    * Called by the notifier when a UI message arrives via Redis pub/sub.

@@ -1,66 +1,37 @@
-# Plan: cc-discord v0.2.0 — owns meta-agent runtime directly
+# Plan: Fix cc-agent job completion notifications
 
 ## Task
-cc-discord takes over meta-agent process management from cc-agent. It clones repos, spawns
-`claude --continue` sessions, polls input queues, and publishes output. cc-agent is no longer
-involved in meta-agent lifecycle. Upgrade cc-wire to 0.3.0, use discord-scoped Redis keys,
-and deliver a new `MetaAgentManager` module.
+Three bugs prevent cc-agent job completion notifications from reaching the meta-agent session:
+1. Legacy `cca:notify:{ns}` channel is subscribed but messages are silently dropped
+2. `resolveNotifyChannel` falls back to dead `DISCORD_NOTIFY_CHANNEL_ID`; should first look up channelId by namespace from bot's channel map
+3. `forwardNotification` receives wrong channelId (dead notify channel) → session lookup fails (fixed by Bug 2)
 
 ## Approach
 
-Use cc-wire 0.3.0 key builders (`discordMetaInputKey`, `discordChatOutgoing`, `discordNotify`,
-`discordChatLog`) and the `createCcWire(redis)` factory directly — no abstract wrapper.
-The factory provides `wire.discord.*`, `wire.tg.*`, `wire.jobs.*`, `wire.token.*` methods.
+Minimal targeted fixes to the three modules that are broken.
 
-### Key API discoveries
-- `wire.discord.enqueue(ns, msg)` → RPUSH to `cca:discord:meta:{ns}:input`
-- `wire.discord.dequeue(ns)` → RPOP from same
-- `wire.discord.publishOutgoing(ns, msg)` → PUBLISH + LPUSH to `cca:discord:chat:outgoing:{ns}`
-- `wire.discord.setStatus(ns, status)` → SET `cca:discord:meta:{ns}:status`
-- `wire.discord.getStatus(ns)` → GET same
-- `wire.discord.registerChannel(channelId, ns, repoUrl)` → HSET (replaces old STRING approach)
-- `wire.discord.listChannels()` → list all channels from HSET+SET
-- `wire.discord.pollNotify(ns)` → RPOP `cca:discord:notify:{ns}`
-- `wire.token.getMaster()` / `wire.token.setMaster(token)` → master claude token
+### Bug 1 — notifier.ts
+- Import `notifyChannel` from `@gonzih/cc-wire`
+- In `subscribeNamespace()`, subscribe to `notifyChannel(ns)` and add to `channelToNamespace`
+- In `sub.on("message")`, handle `channel === legacyNotifyCh` exactly like `channel === notifyCh`
 
-### Channel key migration
-Old format: `cca:discord:channel:{channelId}` → STRING JSON `{namespace, repoUrl}`
-New format: `cca:discord:channel:{channelId}` → HASH with `namespace`, `repoUrl` fields + index SET
+### Bug 2 — bot.ts + notifier.ts + index.ts
+- Add `getChannelIdForNamespace(ns): string | undefined` to CcDiscordBot (iterate channelNamespaceMap)
+- Add optional `getChannelIdForNamespace` param to `resolveNotifyChannel` (after chatId, before notifyChannelId)
+- Add optional `getChannelIdForNamespace` param to `startNotifier`, thread it through callers
+- Fix `pollNotifyList` primaryTargetId to use namespace lookup first
+- Pass `(ns) => bot.getChannelIdForNamespace(ns)` from index.ts
 
-On startup: scan old STRING keys, HSET + SADD, DEL old keys.
-
-### Meta input key migration  
-Old: `cca:meta:{ns}:input` (used by cc-agent)
-New: `cca:discord:meta:{ns}:input`
-On startup: LRANGE + RPUSH new key + DEL old key.
-
-### Redis channel name changes in notifier
-Old subscribe patterns → new patterns:
-- `cca:chat:outgoing:*` → `cca:discord:chat:outgoing:*`  
-- `cca:notify:{ns}` → `cca:discord:notify:{ns}`
-- `cca:notify:{ns}` (list) → `cca:discord:notify:{ns}`
-- `cca:chat:log:{ns}` → `cca:discord:chat:log:{ns}`
-- `cca:chat:incoming:{ns}` — NO change (`discordChatIncoming` not in v0.3.0 package)
+### Bug 3 — verification only
+- forwardNotification uses sessionKey(channelId) — once correct channelId is passed (Bug 2 fix), it works
 
 ## Files to touch
-- `package.json` — cc-wire ^0.3.0 (already installed)
-- `src/meta-agent-manager.ts` (NEW) — ensureWorkspace, injectMcp, spawnSession, pollQueues
-- `src/router.ts` — remove ensureMetaAgent, update routeToMetaAgent to use discordMetaInputKey
-- `src/notifier.ts` — discord-scoped keys throughout, use createCcWire internally
-- `src/bot.ts` — use wire.discord.registerChannel/listChannels, remove ensureMetaAgent calls
-- `src/index.ts` — create wire, set master token, run startup migrations, start polling
-- `src/notifier.test.ts` — update key names to discord-scoped
-- `src/router.test.ts` — no change (only parseChannelCreateIntent tests)
-- `src/bot.test.ts` — no change (isAudioAttachment, buildAttachmentPrompt tests)
-
-## MCP injection
-Reads `CC_DISCORD_MCP_JSON` env var (JSON template) for full override.
-Default template uses the cc-agent MCP server pattern from money-brain/.mcp.json:
-npx -y --prefer-online @gonzih/cc-agent with CC_AGENT_NAMESPACE, CWD, token, PATH, cache.
+- `src/notifier.ts` — Bug 1 + Bug 2 (subscribe, handle, resolveNotifyChannel)
+- `src/bot.ts` — Bug 2 (getChannelIdForNamespace)
+- `src/index.ts` — Bug 2 (pass callback to startNotifier)
+- `src/notifier.test.ts` — add tests for legacy channel handling and namespace lookup
 
 ## Risks
-- `discordChatIncoming` not exported in v0.3.0 — keep using `chatIncomingChannel` (legacy, still exported)
-- Redis STRING→HASH migration must run before loading channel mappings
-- Concurrent spawns per namespace: guard with `activeNamespaces: Set<string>`
-- `wire.token.getMaster()` throws if not set — guard in spawnSession, fall back to env var
-- `claude --continue -p "..."` with `--output-format text` streams text to stdout line by line
+- Existing `resolveNotifyChannel` tests use 4-arg form; adding optional 5th+6th params is backward-compatible
+- Legacy `notifyChannel(ns)` subscribe adds a new Redis subscription per namespace — safe
+- `getChannelIdForNamespace` iterates Map on every notification; fine for small channel counts
