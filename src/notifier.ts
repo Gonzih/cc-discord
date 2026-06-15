@@ -284,8 +284,8 @@ export function startNotifier(
     const deliverTo = bot.getLoopThreadId(targetChannelId) ?? targetChannelId;
     const chunks = splitLongMessage(text);
     for (const chunk of chunks) {
-      bot.sendToChannelById(deliverTo, chunk).catch((err: Error) => {
-        log("warn", `meta-agent flush sendToChannelById failed (ns=${ns}):`, err.message);
+      bot.sendWithFileDetection(deliverTo, chunk).catch((err: Error) => {
+        log("warn", `meta-agent flush sendWithFileDetection failed (ns=${ns}):`, err.message);
       });
     }
   }

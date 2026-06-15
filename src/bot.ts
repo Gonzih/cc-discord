@@ -402,6 +402,69 @@ export class CcDiscordBot {
     await this.sendToChannel(channel, text);
   }
 
+  /**
+   * Send text to a channel by ID, scanning for absolute file paths and attaching them.
+   * Used exclusively for Claude coordinator output (meta-agent flush).
+   * Falls back to plain text send if no valid files are found.
+   */
+  public async sendWithFileDetection(channelId: string, text: string): Promise<void> {
+    const channel = await this.getChannel(channelId);
+    if (!channel) {
+      console.warn(`[bot] sendWithFileDetection: channel ${channelId} not found`);
+      return;
+    }
+
+    // Extract absolute paths from text — handle bare paths and backtick-wrapped paths
+    const rawMatches = text.match(/`(\/[^`\s]+)`|\/[^\s`'"]+/g) ?? [];
+    const candidates = rawMatches.map((m) => m.replace(/^`|`$/g, ""));
+
+    const MAX_SIZE = 8 * 1024 * 1024;
+    const validPaths: string[] = [];
+    const seen = new Set<string>();
+    for (const candidate of candidates) {
+      // Strip trailing punctuation that may have been caught by the regex
+      const p = candidate.replace(/[.,;:!?)]+$/, "");
+      if (seen.has(p)) continue;
+      seen.add(p);
+      try {
+        if (existsSync(p)) {
+          const st = statSync(p);
+          if (st.isFile() && st.size < MAX_SIZE) {
+            validPaths.push(p);
+          }
+        }
+      } catch {
+        // ignore stat errors
+      }
+    }
+
+    if (validPaths.length > 0) {
+      const formatted = formatForDiscord(text);
+      const chunks = splitLongMessage(formatted);
+      // Send first chunk with file attachments, remaining chunks as plain text
+      const files = validPaths.map((p) => ({ attachment: p, name: basename(p) }));
+      try {
+        await (channel as TextChannel).send({ content: chunks[0] || undefined, files });
+      } catch (err) {
+        console.warn(`[bot] sendWithFileDetection attach failed:`, (err as Error).message);
+        // Fall back to plain text for the first chunk
+        if (chunks[0]?.trim()) {
+          await (channel as TextChannel).send(chunks[0]).catch((e: Error) => {
+            console.error("[bot] sendWithFileDetection fallback failed:", e.message);
+          });
+        }
+      }
+      for (const chunk of chunks.slice(1)) {
+        if (!chunk.trim()) continue;
+        await (channel as TextChannel).send(chunk).catch((e: Error) => {
+          console.error("[bot] send failed:", e.message);
+        });
+      }
+    } else {
+      await this.sendToChannel(channel, text);
+    }
+  }
+
   private isAllowed(userId: string): boolean {
     if (!this.opts.allowedUserIds?.length) return true;
     return this.opts.allowedUserIds.includes(userId);
