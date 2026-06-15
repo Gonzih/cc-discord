@@ -1,46 +1,13 @@
-# TODO: cc-discord v0.2.0
+# TODO: fix cc-agent job completion notifications
 
-- [x] Read source + cc-wire 0.3.0 API + write PLAN.md
-- [ ] git checkout -b feat/v0.2.0
-- [ ] Update package.json cc-wire to ^0.3.0
-- [ ] Create src/meta-agent-manager.ts
-  - [ ] ensureWorkspace(ns, repoUrl)
-  - [ ] injectMcp(ns, workspacePath, token)
-  - [ ] spawnSession(ns, message, wire)
-  - [ ] startPolling(wire, getNamespaces) using TIMING.INPUT_POLL_INTERVAL_MS
-  - [ ] stop()
-- [ ] Update src/router.ts
-  - [ ] Remove ensureMetaAgent function
-  - [ ] Replace metaInputKey with discordMetaInputKey in routeToMetaAgent
-  - [ ] Remove old cc-wire imports (metaAgentStatusKey, metaKey, metaInputKey)
-- [ ] Update src/notifier.ts
-  - [ ] Import createCcWire; build wire inside startNotifier from redis param
-  - [ ] Replace chatLogKey → discordChatLog in writeChatLog
-  - [ ] Replace chatOutgoingChannel → discordChatOutgoing in writeChatLog + psubscribe
-  - [ ] Replace notifyChannel → discordNotify in subscribe + message handler
-  - [ ] Replace notifyListKey → discordNotify in pollOneNamespace
-  - [ ] Replace metaAgentStatusKey/metaInputKey chat-incoming routing → wire.discord.getStatus/enqueue
-  - [ ] Remove META_AGENT_FLUSH_DELAY_MS const (use TIMING.META_AGENT_FLUSH_DELAY_MS from cc-wire)
-- [ ] Update src/bot.ts
-  - [ ] Create wire = createCcWire(redis) in constructor
-  - [ ] Replace persistChannelMapping → wire.discord.registerChannel
-  - [ ] Replace loadChannelMappings body → wire.discord.listChannels()
-  - [ ] Remove ensureMetaAgent import + calls (replace with meta-agent-manager ensureWorkspace+injectMcp)
-  - [ ] Import MetaAgentManager; hold reference; connect pollQueues  
-  - [ ] Expose startMetaAgentPolling(namespaces) method
-- [ ] Update src/index.ts
-  - [ ] Create wire = createCcWire(sharedRedis)
-  - [ ] wire.token.setMaster(claudeToken) on startup
-  - [ ] Run startup migrations (channel STRING→HASH, meta input key rename)
-  - [ ] Create MetaAgentManager; start polling
-  - [ ] Pass wire to bot/notifier as needed
-- [ ] Update src/notifier.test.ts
-  - [ ] Replace notifyListKey → discordNotify in test setup
-  - [ ] Update psubscribe pattern test expectations
+- [ ] git checkout -b fix/notification-routing
+- [ ] src/notifier.ts — import notifyChannel; subscribe to legacy channel; handle in message handler
+- [ ] src/notifier.ts — add getChannelIdForNamespace to resolveNotifyChannel + startNotifier; fix pollNotifyList
+- [ ] src/bot.ts — add getChannelIdForNamespace() public method
+- [ ] src/index.ts — pass getChannelIdForNamespace to startNotifier
+- [ ] src/notifier.test.ts — add tests for legacy channel and namespace lookup
 - [ ] npm test — all pass
 - [ ] git diff --staged — verify
 - [ ] git commit + push
-- [ ] npm run build
-- [ ] npm version minor (0.1.17 → 0.2.0)
-- [ ] npm publish --access public
+- [ ] npm version patch && npm publish --access public
 - [ ] gh pr create + gh pr merge --squash --auto

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { parseNotification, resolveNotifyChannel, startNotifier } from "./notifier.js";
-import { discordNotify, discordChatOutgoing } from "@gonzih/cc-wire";
+import { discordNotify, discordChatOutgoing, notifyChannel } from "@gonzih/cc-wire";
 
 describe("resolveNotifyChannel", () => {
   it("returns reverseSnowflakeLookup result when chatId and lookup available", () => {
@@ -23,6 +23,27 @@ describe("resolveNotifyChannel", () => {
 
   it("returns undefined when no fallbacks available", () => {
     expect(resolveNotifyChannel(undefined, null, undefined, undefined)).toBeUndefined();
+  });
+
+  it("uses getChannelIdForNamespace when ns is provided", () => {
+    const lookup = (_ns: string) => "ns-channel";
+    expect(resolveNotifyChannel(undefined, "notify-channel", undefined, undefined, "my-ns", lookup)).toBe("ns-channel");
+  });
+
+  it("prefers getChannelIdForNamespace over notifyChannelId", () => {
+    const lookup = (_ns: string) => "ns-channel";
+    expect(resolveNotifyChannel(undefined, "dead-notify-ch", undefined, undefined, "my-ns", lookup)).toBe("ns-channel");
+  });
+
+  it("still falls back to notifyChannelId when getChannelIdForNamespace returns undefined", () => {
+    const lookup = (_ns: string) => undefined;
+    expect(resolveNotifyChannel(undefined, "notify-channel", undefined, undefined, "my-ns", lookup)).toBe("notify-channel");
+  });
+
+  it("reverseSnowflakeLookup takes priority over getChannelIdForNamespace", () => {
+    const snowflakeLookup = (n: number) => (n === 42 ? "channel-42" : undefined);
+    const nsLookup = (_ns: string) => "ns-channel";
+    expect(resolveNotifyChannel(42, "notify-channel", undefined, snowflakeLookup, "my-ns", nsLookup)).toBe("channel-42");
   });
 });
 
@@ -297,6 +318,31 @@ describe("startNotifier — per-namespace list polling", () => {
     expect(sent).toContainEqual({ channelId: "primary-notify-ch", text: "primary done" });
   });
 
+  it("routes primary-namespace notifications to getChannelIdForNamespace result, ignoring notifyChannelId", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockRedis, sent, listQueues } = buildMocks();
+
+    const primaryListKey = discordNotify("money-brain");
+    listQueues.set(primaryListKey, [JSON.stringify({ text: "namespace routed" })]);
+
+    startNotifier(
+      mockBot as never,
+      "dead-notify-ch",         // would be sent here without the namespace lookup
+      "money-brain",
+      mockRedis as never,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      (_ns) => "correct-ns-channel",  // getChannelIdForNamespace
+    );
+
+    await vi.advanceTimersByTimeAsync(5_100);
+
+    expect(sent).toContainEqual({ channelId: "correct-ns-channel", text: "namespace routed" });
+    expect(sent.every((m) => m.channelId !== "dead-notify-ch")).toBe(true);
+  });
+
   it("skips routing-excluded notifications from routed namespace list", async () => {
     vi.useFakeTimers();
     const { mockBot, mockRedis, sent, listQueues } = buildMocks();
@@ -317,5 +363,75 @@ describe("startNotifier — per-namespace list polling", () => {
 
     // routing: ["telegram"] excludes discord — nothing should be sent
     expect(sent).toHaveLength(0);
+  });
+});
+
+describe("startNotifier — legacy notifyChannel (cca:notify:{ns}) pub/sub", () => {
+  it("subscribes to legacy cca:notify:{ns} channel", () => {
+    const { mockBot, mockSub, mockRedis } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    const subscribed = mockSub.subscribe.mock.calls.map((c: unknown[]) => c[0] as string);
+    expect(subscribed).toContain(notifyChannel("money-brain"));
+  });
+
+  it("handles messages on legacy cca:notify:{ns} channel and delivers to notifyChannelId", () => {
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    mockSub.emit("message", notifyChannel("money-brain"), JSON.stringify({ text: "legacy job done" }));
+
+    expect(sent).toContainEqual({ channelId: "primary-notify-ch", text: "legacy job done" });
+  });
+
+  it("handles messages on legacy channel and uses getChannelIdForNamespace over notifyChannelId", () => {
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "dead-notify-ch",
+      "money-brain",
+      mockRedis as never,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      (_ns) => "correct-ns-channel",
+    );
+
+    mockSub.emit("message", notifyChannel("money-brain"), JSON.stringify({ text: "legacy via namespace" }));
+
+    expect(sent).toContainEqual({ channelId: "correct-ns-channel", text: "legacy via namespace" });
+    expect(sent.every((m) => m.channelId !== "dead-notify-ch")).toBe(true);
+  });
+
+  it("calls forwardNotification when legacy channel delivers a notification", () => {
+    const { mockBot, mockSub, mockRedis } = buildMocks();
+    const forwarded: Array<{ channelId: string; text: string }> = [];
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+      undefined,
+      (channelId, text) => forwarded.push({ channelId, text }),
+    );
+
+    mockSub.emit("message", notifyChannel("money-brain"), "legacy plain text");
+
+    expect(forwarded).toContainEqual({ channelId: "primary-notify-ch", text: "legacy plain text" });
   });
 });
