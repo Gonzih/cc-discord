@@ -124,10 +124,11 @@ describe("parseNotification", () => {
 });
 
 /** Build the minimal mocks needed to call startNotifier without a real Redis or Discord client. */
-function buildMocks() {
+function buildMocks(loopThreadMap?: Map<string, string>) {
   // Track messages sent by the bot
   const sent: Array<{ channelId: string; text: string }> = [];
   const stoppedTyping: string[] = [];
+  const evalEmbeds: Array<{ channelId: string; report: unknown }> = [];
   const mockBot = {
     sendToChannelById: vi.fn((channelId: string, text: string) => {
       sent.push({ channelId, text });
@@ -135,6 +136,11 @@ function buildMocks() {
     }),
     stopMetaAgentTyping: vi.fn((channelId: string) => {
       stoppedTyping.push(channelId);
+    }),
+    getLoopThreadId: vi.fn((channelId: string) => loopThreadMap?.get(channelId)),
+    postEvalEmbed: vi.fn((channelId: string, report: unknown) => {
+      evalEmbeds.push({ channelId, report });
+      return Promise.resolve();
     }),
   };
 
@@ -177,7 +183,7 @@ function buildMocks() {
     smembers: vi.fn().mockResolvedValue([]),
   };
 
-  return { mockBot, mockSub, mockRedis, sent, stoppedTyping, listQueues };
+  return { mockBot, mockSub, mockRedis, sent, stoppedTyping, evalEmbeds, listQueues };
 }
 
 describe("startNotifier — pmessage (cca:discord:chat:outgoing:*)", () => {
@@ -433,5 +439,121 @@ describe("startNotifier — legacy notifyChannel (cca:notify:{ns}) pub/sub", () 
     mockSub.emit("message", notifyChannel("money-brain"), "legacy plain text");
 
     expect(forwarded).toContainEqual({ channelId: "primary-notify-ch", text: "legacy plain text" });
+  });
+});
+
+describe("parseNotification — eval_report", () => {
+  it("returns evalReport when eval_report present in JSON payload", () => {
+    const raw = JSON.stringify({
+      text: "Gate check",
+      eval_report: { gate: "completion", passed: true, feedback: "done", iteration: 1, max_iterations: 5, confidence: 0.9 },
+    });
+    const result = parseNotification(raw);
+    expect(result?.evalReport).toMatchObject({ gate: "completion", passed: true, confidence: 0.9 });
+  });
+
+  it("returns evalReport=undefined when no eval_report in payload", () => {
+    const raw = JSON.stringify({ text: "just a notification" });
+    const result = parseNotification(raw);
+    expect(result?.evalReport).toBeUndefined();
+  });
+
+  it("returns evalReport=undefined for plain text (non-JSON) notifications", () => {
+    const result = parseNotification("plain text message");
+    expect(result?.evalReport).toBeUndefined();
+  });
+});
+
+describe("startNotifier — loop thread routing", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("routes notify list messages to the loop thread when getLoopThreadId returns a thread", async () => {
+    vi.useFakeTimers();
+    // Map primary channel → thread
+    const loopThreadMap = new Map([["primary-notify-ch", "thread-id-123"]]);
+    const { mockBot, mockRedis, sent, listQueues } = buildMocks(loopThreadMap);
+
+    const primaryListKey = discordNotify("money-brain");
+    listQueues.set(primaryListKey, [JSON.stringify({ text: "loop iteration output" })]);
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    await vi.advanceTimersByTimeAsync(5_100);
+
+    // Should deliver to the thread, not the main channel
+    expect(sent).toContainEqual({ channelId: "thread-id-123", text: "loop iteration output" });
+    expect(sent.every((m) => m.channelId !== "primary-notify-ch")).toBe(true);
+  });
+
+  it("posts eval embed when notification contains eval_report", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockRedis, evalEmbeds, listQueues } = buildMocks();
+
+    const primaryListKey = discordNotify("money-brain");
+    listQueues.set(primaryListKey, [
+      JSON.stringify({
+        text: "Gate check",
+        eval_report: { gate: "quality", passed: false, feedback: "needs work", iteration: 2, max_iterations: 5, confidence: 0.4 },
+      }),
+    ]);
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    await vi.advanceTimersByTimeAsync(5_100);
+
+    expect(evalEmbeds).toHaveLength(1);
+    expect(evalEmbeds[0]).toMatchObject({
+      channelId: "primary-notify-ch",
+      report: expect.objectContaining({ gate: "quality", passed: false }),
+    });
+  });
+
+  it("routes pubsub notify messages to loop thread when getLoopThreadId returns thread", () => {
+    const loopThreadMap = new Map([["primary-notify-ch", "thread-pubsub-456"]]);
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks(loopThreadMap);
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    mockSub.emit("message", discordNotify("money-brain"), JSON.stringify({ text: "pubsub loop output" }));
+
+    expect(sent).toContainEqual({ channelId: "thread-pubsub-456", text: "pubsub loop output" });
+  });
+
+  it("routes meta-agent buffer to loop thread in flushMetaAgentBuffer", async () => {
+    vi.useFakeTimers();
+    const loopThreadMap = new Map([["primary-notify-ch", "thread-meta-789"]]);
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks(loopThreadMap);
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    const msg = JSON.stringify({ source: "claude", content: "loop step output" });
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), msg);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(sent).toContainEqual(expect.objectContaining({ channelId: "thread-meta-789" }));
+    expect(sent.every((m) => m.channelId !== "primary-notify-ch")).toBe(true);
   });
 });

@@ -8,6 +8,10 @@ import {
   GatewayIntentBits,
   Guild,
   Message,
+  MessageReaction,
+  PartialMessageReaction,
+  User,
+  PartialUser,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -33,6 +37,7 @@ import { transcribeVoice, isVoiceAvailable } from "./voice.js";
 import { formatForDiscord, splitLongMessage, stripAnsi } from "./formatter.js";
 import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./tokens.js";
 import { writeChatLog, type ChatMessage } from "./notifier.js";
+import { LoopManager, isGoalMessage, type EvalReport } from "./loop-manager.js";
 import { CronManager } from "./cron.js";
 import { parseChannelCreateIntent, routeToMetaAgent } from "./router.js";
 import { createMetaAgentManager, type MetaAgentManager } from "./meta-agent-manager.js";
@@ -198,12 +203,15 @@ export class CcDiscordBot {
   /** ClaudeProcess running the MCP tool bridge (for callCcAgentTool) */
   private mcpSession?: ClaudeProcess;
 
+  private loopManager?: LoopManager;
+
   constructor(opts: DiscordBotOptions) {
     this.opts = opts;
     this.redis = opts.redis;
     this.namespace = opts.namespace ?? "default";
     if (opts.redis) {
       this.wire = createCcWire(opts.redis);
+      this.loopManager = new LoopManager(opts.redis);
     }
     this.metaAgentManager = createMetaAgentManager();
 
@@ -213,6 +221,7 @@ export class CcDiscordBot {
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.DirectMessages,
+        GatewayIntentBits.GuildMessageReactions,
       ],
     });
 
@@ -247,6 +256,10 @@ export class CcDiscordBot {
     this.client.on(Events.InteractionCreate, (interaction) => {
       if (!interaction.isChatInputCommand()) return;
       void this.handleSlashCommand(interaction);
+    });
+
+    this.client.on(Events.MessageReactionAdd, (reaction, user) => {
+      void this.handleReactionAdd(reaction as MessageReaction | PartialMessageReaction, user as User | PartialUser);
     });
 
     this.client.on("error", (err: Error) => {
@@ -471,13 +484,47 @@ export class CcDiscordBot {
       }
     }
 
+    // Handle messages sent inside a loop thread — route to the running meta-agent session
+    if (msg.channel.isThread() && this.redis && this.loopManager) {
+      const parentId = (msg.channel as ThreadChannel).parentId;
+      if (parentId) {
+        const loopState = this.loopManager.getState(parentId);
+        if (loopState && loopState.threadId === effectiveChannelId) {
+          const username = msg.member?.displayName ?? msg.author.username;
+          try {
+            await routeToMetaAgent(loopState.namespace, stampPrompt(text, username, msg.createdAt), this.redis);
+          } catch (err) {
+            await (msg.channel as ThreadChannel).send(`Failed to route: ${(err as Error).message}`).catch(() => {});
+          }
+          return;
+        }
+      }
+    }
+
     // Channel registered via createChannelForRepo or /channel — route directly to its meta-agent
     const mappedNs = this.channelNamespaceMap.get(effectiveChannelId);
     if (mappedNs && this.redis) {
+      // If a loop is already running for this channel, point the user to the thread
+      if (this.loopManager?.isActive(effectiveChannelId)) {
+        const loopState = this.loopManager.getState(effectiveChannelId)!;
+        await (msg.channel as TextChannel).send(
+          `Loop in progress → <#${loopState.threadId}>\nSend messages in the thread to interact with the running loop.`
+        ).catch(() => {});
+        return;
+      }
+
       this.writeChatMessage("user", "discord", text, effectiveChannelId, mappedNs.namespace);
       this.opts.registerRoutedChannelId?.(mappedNs.namespace, effectiveChannelId);
       this.persistChannelMapping(effectiveChannelId, mappedNs.namespace, mappedNs.repoUrl);
       this.startMetaAgentTyping(effectiveChannelId, msg.channel as SendableChannel);
+
+      // Detect goal messages → create a thread for loop tracking
+      if (this.loopManager && msg.guild && !msg.channel.isThread()) {
+        if (isGoalMessage(text)) {
+          await this.createLoopThread(msg, effectiveChannelId, mappedNs.namespace, text);
+        }
+      }
+
       const username = msg.member?.displayName ?? msg.author.username;
       try {
         await routeToMetaAgent(mappedNs.namespace, stampPrompt(text, username, msg.createdAt), this.redis);
@@ -1170,6 +1217,144 @@ export class CcDiscordBot {
       if (mapping.namespace === ns) return channelId;
     }
     return undefined;
+  }
+
+  /** Return the thread ID for an active loop on `channelId`, or undefined. */
+  public getLoopThreadId(channelId: string): string | undefined {
+    return this.loopManager?.getThreadId(channelId);
+  }
+
+  /**
+   * Post a structured eval-report embed to the loop thread for `channelId`.
+   * Also records gate failures in the LoopManager if the gate did not pass.
+   */
+  public async postEvalEmbed(channelId: string, report: EvalReport): Promise<void> {
+    const threadId = this.loopManager?.getThreadId(channelId);
+    if (!threadId) return;
+    const channel = await this.getChannel(threadId);
+    if (!channel) return;
+
+    const color = report.passed ? 0x57F287 : 0xED4245; // green / red
+    const embed = new EmbedBuilder()
+      .setTitle(`${report.passed ? "✅" : "❌"} Gate: ${report.gate}`)
+      .setColor(color)
+      .addFields(
+        { name: "Result", value: report.passed ? "PASSED" : "FAILED", inline: true },
+        { name: "Confidence", value: `${(report.confidence * 100).toFixed(0)}%`, inline: true },
+        { name: "Iteration", value: `${report.iteration} / ${report.maxIterations}`, inline: true },
+        { name: "Feedback", value: report.feedback || "(none)", inline: false },
+      )
+      .setTimestamp();
+
+    await (channel as TextChannel).send({ embeds: [embed] }).catch((err: Error) => {
+      console.warn(`[bot] postEvalEmbed send failed:`, err.message);
+    });
+
+    if (!report.passed && this.loopManager) {
+      await this.loopManager.addGateFailure(channelId, {
+        gate: report.gate,
+        feedback: report.feedback,
+        iteration: report.iteration,
+        confidence: report.confidence,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  /**
+   * Create a Discord thread on `msg`, register loop state, and add reaction gates.
+   * Requires MANAGE_THREADS permission. Falls back silently on failure.
+   */
+  private async createLoopThread(
+    msg: Message,
+    channelId: string,
+    namespace: string,
+    goal: string
+  ): Promise<void> {
+    try {
+      const shortGoal = goal.slice(0, 48).replace(/\s+/g, " ");
+      const threadName = `Goal: ${shortGoal}${goal.length > 48 ? "…" : ""}`;
+      const thread = await (msg.channel as TextChannel).threads.create({
+        name: threadName,
+        autoArchiveDuration: 10080, // 1 week
+        startMessage: msg,
+        reason: "Loop observability thread",
+      });
+
+      const firstMsg = await thread.send(
+        `🎯 **Loop tracking thread**\n> ${goal.slice(0, 200)}\n\nReact to control the loop:\n` +
+        `🔄 Retry current iteration  ✅ Accept & exit  ❌ Kill loop`
+      );
+      await firstMsg.react("🔄");
+      await firstMsg.react("✅");
+      await firstMsg.react("❌");
+
+      await this.loopManager!.startLoop(channelId, thread.id, firstMsg.id, namespace, goal);
+      console.log(`[bot] loop thread created: channelId=${channelId} threadId=${thread.id}`);
+    } catch (err) {
+      console.warn(`[bot] createLoopThread failed:`, (err as Error).message);
+    }
+  }
+
+  /** Handle 🔄/✅/❌ reactions on loop gate messages. */
+  private async handleReactionAdd(
+    reaction: MessageReaction | PartialMessageReaction,
+    user: User | PartialUser
+  ): Promise<void> {
+    if (user.bot) return;
+    if (!this.isAllowed(user.id)) return;
+    if (!this.loopManager || !this.redis) return;
+
+    // Fetch full reaction object if partial (bot doesn't have it cached)
+    let fullReaction = reaction;
+    if (reaction.partial) {
+      try {
+        fullReaction = await reaction.fetch();
+      } catch {
+        return;
+      }
+    }
+
+    const emoji = fullReaction.emoji.name;
+    if (emoji !== "🔄" && emoji !== "✅" && emoji !== "❌") return;
+
+    const messageId = fullReaction.message.id;
+    const channelId = this.loopManager.getChannelIdByReactionMessage(messageId);
+    if (!channelId) return;
+
+    const loopState = this.loopManager.getState(channelId);
+    if (!loopState) return;
+
+    const thread = await this.getChannel(loopState.threadId);
+
+    if (emoji === "🔄") {
+      if (thread) {
+        await (thread as ThreadChannel).send(
+          `🔄 Retry requested — re-running iteration ${loopState.iteration + 1}`
+        ).catch(() => {});
+      }
+      try {
+        await routeToMetaAgent(
+          loopState.namespace,
+          `Please retry the previous goal: ${loopState.goal}`,
+          this.redis
+        );
+      } catch (err) {
+        console.warn(`[bot] retry routeToMetaAgent failed:`, (err as Error).message);
+      }
+    } else if (emoji === "✅") {
+      if (thread) {
+        await (thread as ThreadChannel).send("✅ Loop accepted — marking complete").catch(() => {});
+      }
+      await this.sendToChannelById(channelId, `✅ Goal completed: ${loopState.goal.slice(0, 100)}`);
+      await this.loopManager.endLoop(channelId);
+    } else if (emoji === "❌") {
+      if (thread) {
+        await (thread as ThreadChannel).send("❌ Loop killed by user").catch(() => {});
+      }
+      await this.sendToChannelById(channelId, `❌ Loop killed: ${loopState.goal.slice(0, 100)}`);
+      await this.loopManager.endLoop(channelId);
+    }
   }
 
   /**

@@ -24,6 +24,7 @@ import {
   type Transport,
 } from "@gonzih/cc-wire";
 import { splitLongMessage, stripAnsi } from "./formatter.js";
+import { parseEvalReport, type EvalReport } from "./loop-manager.js";
 import type { CcDiscordBot } from "./bot.js";
 
 export interface ChatMessage {
@@ -55,6 +56,8 @@ function shortenModelName(model: string, driver: string): string {
 export interface ParsedNotification {
   text: string;
   chatId?: number;
+  /** Populated when the notification JSON contains an `eval_report` object. */
+  evalReport?: EvalReport;
 }
 
 /**
@@ -85,12 +88,15 @@ export function parseNotification(raw: string): ParsedNotification | null {
     return { text };
   }
 
-  if (!driver) return { text, chatId };
+  // Parse eval_report if present — this field is non-standard and not in NotificationPayload type
+  const evalReport = parseEvalReport(raw);
+
+  if (!driver) return { text, chatId, evalReport: evalReport ?? undefined };
 
   const shortModel = shortenModelName(model ?? "", driver);
   const badge = shortModel ? `${driver}:${shortModel}` : driver;
   const costStr = cost != null ? ` cost: $${cost.toFixed(3)}` : "";
-  return { text: `${text}\n[${badge}]${costStr}`, chatId };
+  return { text: `${text}\n[${badge}]${costStr}`, chatId, evalReport: evalReport ?? undefined };
 }
 
 /**
@@ -271,9 +277,11 @@ export function startNotifier(
     const text = `← [${ns}] ` + stripAnsi(buf.text.trim());
     buf.text = "";
     buf.timer = null;
+    // During an active loop, route meta-agent output to the thread rather than main channel
+    const deliverTo = bot.getLoopThreadId(targetChannelId) ?? targetChannelId;
     const chunks = splitLongMessage(text);
     for (const chunk of chunks) {
-      bot.sendToChannelById(targetChannelId, chunk).catch((err: Error) => {
+      bot.sendToChannelById(deliverTo, chunk).catch((err: Error) => {
         log("warn", `meta-agent flush sendToChannelById failed (ns=${ns}):`, err.message);
       });
     }
@@ -351,14 +359,22 @@ export function startNotifier(
       // Primary namespace: honour chatId-based per-channel routing via reverseSnowflakeLookup,
       // then namespace → channelId lookup, then notifyChannelId / active channel.
       // Routed namespaces: always deliver to the registered Discord channelId — no leakage.
-      const destChannelId = ns === namespace
+      const mainChannelId = ns === namespace
         ? (resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup, ns, getChannelIdForNamespace) ?? targetChannelId)
         : targetChannelId;
+      // If a loop is active for this channel, route to its thread
+      const destChannelId = bot.getLoopThreadId(mainChannelId) ?? mainChannelId;
+      // When an eval report is embedded, post a structured embed to the thread
+      if (notification.evalReport) {
+        bot.postEvalEmbed(mainChannelId, notification.evalReport).catch((err: Error) => {
+          log("warn", `postEvalEmbed failed (ns=${ns}):`, err.message);
+        });
+      }
       bot.sendToChannelById(destChannelId, notification.text).catch((err: Error) => {
         log("warn", `notify list send failed (ns=${ns}):`, err.message);
       });
       if (forwardNotification) {
-        forwardNotification(destChannelId, notification.text);
+        forwardNotification(mainChannelId, notification.text);
       }
     }
 
@@ -400,21 +416,28 @@ export function startNotifier(
     if (channel === notifyCh || channel === legacyNotifyCh) {
       const notification = parseNotification(message);
       if (notification === null) return; // routing excludes discord
-      let targetId: string | undefined;
+      let mainChannelId: string | undefined;
       if (isPrimary) {
-        targetId = resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup, ns, getChannelIdForNamespace);
+        mainChannelId = resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup, ns, getChannelIdForNamespace);
       } else {
         // For routed namespaces, only use the registered channelId — no fallback to primary
-        targetId = notification.chatId != null && reverseSnowflakeLookup
+        mainChannelId = notification.chatId != null && reverseSnowflakeLookup
           ? (reverseSnowflakeLookup(notification.chatId) ?? routedChannelIds.get(ns))
           : routedChannelIds.get(ns);
       }
-      if (targetId != null) {
-        bot.sendToChannelById(targetId, notification.text).catch((err: Error) => {
+      if (mainChannelId != null) {
+        // If a loop is active, route notification text to the thread
+        const deliverTo = bot.getLoopThreadId(mainChannelId) ?? mainChannelId;
+        if (notification.evalReport) {
+          bot.postEvalEmbed(mainChannelId, notification.evalReport).catch((err: Error) => {
+            log("warn", `postEvalEmbed failed (ns=${ns}):`, err.message);
+          });
+        }
+        bot.sendToChannelById(deliverTo, notification.text).catch((err: Error) => {
           log("warn", `notify send failed (ns=${ns}):`, err.message);
         });
         if (forwardNotification) {
-          forwardNotification(targetId, notification.text);
+          forwardNotification(mainChannelId, notification.text);
         }
       } else {
         log("warn", `notify: no channelId available for ns=${ns}, dropping notification`);

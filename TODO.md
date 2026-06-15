@@ -1,11 +1,11 @@
-# TODO: fix cc-agent job completion notifications
+# TODO: loop observability layer
 
-- [ ] git checkout -b fix/notification-routing
-- [ ] src/notifier.ts — import notifyChannel; subscribe to legacy channel; handle in message handler
-- [ ] src/notifier.ts — add getChannelIdForNamespace to resolveNotifyChannel + startNotifier; fix pollNotifyList
-- [ ] src/bot.ts — add getChannelIdForNamespace() public method
-- [ ] src/index.ts — pass getChannelIdForNamespace to startNotifier
-- [ ] src/notifier.test.ts — add tests for legacy channel and namespace lookup
+- [x] git checkout -b feat/loop-observability
+- [ ] src/loop-manager.ts — create LoopState, GateFailure, EvalReport, LoopManager, isGoalMessage, parseEvalReport
+- [ ] src/bot.ts — add GuildMessageReactions intent, LoopManager field, handleReactionAdd, createLoopThread, getLoopThreadId, postEvalEmbed, modify handleMessage for loop detection + thread routing
+- [ ] src/notifier.ts — extend ParsedNotification with evalReport, update parseNotification, thread routing in flushMetaAgentBuffer / pollOneNamespace / pubsub handler
+- [ ] src/loop-manager.test.ts — unit tests for isGoalMessage, parseEvalReport, LoopManager
+- [ ] src/notifier.test.ts — tests for eval_report parsing and thread routing
 - [ ] npm test — all pass
 - [ ] git diff --staged — verify
 - [ ] git commit + push
