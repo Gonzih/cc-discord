@@ -1,6 +1,6 @@
 {
   "name": "@gonzih/cc-discord",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Claude Code Discord bot — chat with Claude Code via Discord",
   "type": "module",
   "bin": {
