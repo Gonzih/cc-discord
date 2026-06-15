@@ -1348,12 +1348,18 @@ export class CcDiscordBot {
       }
       await this.sendToChannelById(channelId, `✅ Goal completed: ${loopState.goal.slice(0, 100)}`);
       await this.loopManager.endLoop(channelId);
+      if (thread && thread.isThread()) {
+        await thread.setArchived(true).catch(() => {});
+      }
     } else if (emoji === "❌") {
       if (thread) {
         await (thread as ThreadChannel).send("❌ Loop killed by user").catch(() => {});
       }
       await this.sendToChannelById(channelId, `❌ Loop killed: ${loopState.goal.slice(0, 100)}`);
       await this.loopManager.endLoop(channelId);
+      if (thread && thread.isThread()) {
+        await thread.setArchived(true).catch(() => {});
+      }
     }
   }
 
