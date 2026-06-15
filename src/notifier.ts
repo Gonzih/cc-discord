@@ -16,6 +16,7 @@ import {
   discordChatLog,
   discordChatOutgoing,
   discordNotify,
+  notifyChannel,
   chatIncomingChannel,
   createCcWire,
   TIMING,
@@ -118,17 +119,26 @@ export function writeChatLog(
 
 /**
  * Resolve the target Discord channelId for a notification.
- * When chatId is set and a reverse-lookup function is available, prefer the originating channel.
- * Falls back to notifyChannelId, then getActiveChannelId.
+ * Priority:
+ *   1. chatId → reverseSnowflakeLookup (originating channel from the notification payload)
+ *   2. ns → getChannelIdForNamespace (registered Discord channel for this namespace)
+ *   3. notifyChannelId (static env var — may be stale/dead)
+ *   4. getActiveChannelId (last channel that sent a message)
  */
 export function resolveNotifyChannel(
   chatId: number | undefined,
   notifyChannelId: string | null,
   getActiveChannelId?: () => string | undefined,
-  reverseSnowflakeLookup?: (n: number) => string | undefined
+  reverseSnowflakeLookup?: (n: number) => string | undefined,
+  ns?: string,
+  getChannelIdForNamespace?: (ns: string) => string | undefined
 ): string | undefined {
   if (chatId != null && reverseSnowflakeLookup) {
     const resolved = reverseSnowflakeLookup(chatId);
+    if (resolved) return resolved;
+  }
+  if (ns && getChannelIdForNamespace) {
+    const resolved = getChannelIdForNamespace(ns);
     if (resolved) return resolved;
   }
   return notifyChannelId ?? getActiveChannelId?.();
@@ -148,14 +158,15 @@ export interface NotifierHandle {
 /**
  * Start the Discord notifier.
  *
- * @param bot                     - CcDiscordBot instance (for sending messages)
- * @param notifyChannelId         - Discord channel ID to forward notifications to. Pass null to use getActiveChannelId.
- * @param namespace               - primary namespace (used to build Redis channel names)
- * @param redis                   - ioredis client in normal mode (will be duplicated for pub/sub)
- * @param handleUserMessage       - Optional callback to feed UI messages into the active Claude session
- * @param forwardNotification     - Optional callback to forward job notifications
- * @param getActiveChannelId      - Optional callback to resolve channelId dynamically
- * @param reverseSnowflakeLookup  - Optional callback to resolve a chatId integer to a Discord channelId
+ * @param bot                       - CcDiscordBot instance (for sending messages)
+ * @param notifyChannelId           - Discord channel ID to forward notifications to. Pass null to use getActiveChannelId.
+ * @param namespace                 - primary namespace (used to build Redis channel names)
+ * @param redis                     - ioredis client in normal mode (will be duplicated for pub/sub)
+ * @param handleUserMessage         - Optional callback to feed UI messages into the active Claude session
+ * @param forwardNotification       - Optional callback to forward job notifications
+ * @param getActiveChannelId        - Optional callback to resolve channelId dynamically
+ * @param reverseSnowflakeLookup    - Optional callback to resolve a chatId integer to a Discord channelId
+ * @param getChannelIdForNamespace  - Optional callback to resolve a namespace to its registered Discord channelId
  */
 export function startNotifier(
   bot: CcDiscordBot,
@@ -165,7 +176,8 @@ export function startNotifier(
   handleUserMessage?: (channelId: string, text: string) => void,
   forwardNotification?: (channelId: string, text: string) => void,
   getActiveChannelId?: () => string | undefined,
-  reverseSnowflakeLookup?: (n: number) => string | undefined
+  reverseSnowflakeLookup?: (n: number) => string | undefined,
+  getChannelIdForNamespace?: (ns: string) => string | undefined
 ): NotifierHandle {
   const wire = createCcWire(redis);
 
@@ -198,8 +210,10 @@ export function startNotifier(
     subscribedNamespaces.add(ns);
 
     const notifyCh = discordNotify(ns);
+    const legacyNotifyCh = notifyChannel(ns);
     const incomingCh = chatIncomingChannel(ns);
     channelToNamespace.set(notifyCh, ns);
+    channelToNamespace.set(legacyNotifyCh, ns);
     channelToNamespace.set(incomingCh, ns);
 
     sub.subscribe(notifyCh, (err) => {
@@ -207,6 +221,14 @@ export function startNotifier(
         log("error", `subscribe ${notifyCh} failed:`, err.message);
       } else {
         log("info", `subscribed to ${notifyCh}`);
+      }
+    });
+
+    sub.subscribe(legacyNotifyCh, (err) => {
+      if (err) {
+        log("error", `subscribe ${legacyNotifyCh} failed:`, err.message);
+      } else {
+        log("info", `subscribed to ${legacyNotifyCh}`);
       }
     });
 
@@ -326,10 +348,11 @@ export function startNotifier(
     for (const raw of items) {
       const notification = parseNotification(raw);
       if (notification === null) continue; // routing excludes discord
-      // Primary namespace: honour chatId-based per-channel routing via reverseSnowflakeLookup.
+      // Primary namespace: honour chatId-based per-channel routing via reverseSnowflakeLookup,
+      // then namespace → channelId lookup, then notifyChannelId / active channel.
       // Routed namespaces: always deliver to the registered Discord channelId — no leakage.
       const destChannelId = ns === namespace
-        ? (resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup) ?? targetChannelId)
+        ? (resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup, ns, getChannelIdForNamespace) ?? targetChannelId)
         : targetChannelId;
       bot.sendToChannelById(destChannelId, notification.text).catch((err: Error) => {
         log("warn", `notify list send failed (ns=${ns}):`, err.message);
@@ -347,8 +370,8 @@ export function startNotifier(
   };
 
   const pollNotifyList = async (): Promise<void> => {
-    // Primary namespace
-    const primaryTargetId = notifyChannelId ?? getActiveChannelId?.();
+    // Primary namespace: prefer registered channel for this namespace, then env var, then active channel
+    const primaryTargetId = getChannelIdForNamespace?.(namespace) ?? notifyChannelId ?? getActiveChannelId?.();
     if (primaryTargetId != null) {
       await pollOneNamespace(namespace, primaryTargetId);
     }
@@ -371,14 +394,15 @@ export function startNotifier(
 
     const isPrimary = ns === namespace;
     const notifyCh = discordNotify(ns);
+    const legacyNotifyCh = notifyChannel(ns);
     const incomingCh = chatIncomingChannel(ns);
 
-    if (channel === notifyCh) {
+    if (channel === notifyCh || channel === legacyNotifyCh) {
       const notification = parseNotification(message);
       if (notification === null) return; // routing excludes discord
       let targetId: string | undefined;
       if (isPrimary) {
-        targetId = resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup);
+        targetId = resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup, ns, getChannelIdForNamespace);
       } else {
         // For routed namespaces, only use the registered channelId — no fallback to primary
         targetId = notification.chatId != null && reverseSnowflakeLookup
