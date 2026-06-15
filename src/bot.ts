@@ -1395,7 +1395,7 @@ export class CcDiscordBot {
     if (!session || session.claude.exited) return;
     try {
       session.claude.sendPrompt(stampPrompt(text));
-      this.writeChatMessage("user", "cc-tg", text, channelId);
+      this.writeChatMessage("user", "cc-discord", text, channelId);
     } catch (err) {
       console.error(`[forwardNotification:${channelId}] failed:`, (err as Error).message);
     }
