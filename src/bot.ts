@@ -554,6 +554,7 @@ export class CcDiscordBot {
         const loopState = this.loopManager.getState(parentId);
         if (loopState && loopState.threadId === effectiveChannelId) {
           const username = msg.member?.displayName ?? msg.author.username;
+          this.startMetaAgentTyping(effectiveChannelId, msg.channel as SendableChannel);
           try {
             await routeToMetaAgent(loopState.namespace, stampPrompt(text, username, msg.createdAt), this.redis);
           } catch (err) {
