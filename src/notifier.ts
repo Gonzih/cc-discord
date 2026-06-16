@@ -274,7 +274,8 @@ export function startNotifier(
   const metaAgentBuffers = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> | null }>();
 
   function flushMetaAgentBuffer(ns: string, targetChannelId: string): void {
-    bot.stopMetaAgentTyping(targetChannelId);
+    const loopThreadId = bot.getLoopThreadId(targetChannelId);
+    bot.stopMetaAgentTyping(loopThreadId ?? targetChannelId);
     const buf = metaAgentBuffers.get(ns);
     if (!buf || !buf.text.trim()) return;
     const text = `← [${ns}] ` + stripAnsi(buf.text.trim());
@@ -365,8 +366,8 @@ export function startNotifier(
       const mainChannelId = ns === namespace
         ? (resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup, ns, getChannelIdForNamespace) ?? targetChannelId)
         : targetChannelId;
-      // If a loop is active for this channel, route to its thread
-      const destChannelId = bot.getLoopThreadId(mainChannelId) ?? mainChannelId;
+      // If a loop is active for this channel, route to its thread (skip for cron notifications)
+      const destChannelId = (!notification.isCron && bot.getLoopThreadId(mainChannelId)) ? bot.getLoopThreadId(mainChannelId)! : mainChannelId;
       // When an eval report is embedded, post a structured embed to the thread
       if (notification.evalReport) {
         bot.postEvalEmbed(mainChannelId, notification.evalReport).catch((err: Error) => {
@@ -429,8 +430,8 @@ export function startNotifier(
           : routedChannelIds.get(ns);
       }
       if (mainChannelId != null) {
-        // If a loop is active, route notification text to the thread
-        const deliverTo = bot.getLoopThreadId(mainChannelId) ?? mainChannelId;
+        // If a loop is active, route notification text to the thread (skip for cron notifications)
+        const deliverTo = (!notification.isCron && bot.getLoopThreadId(mainChannelId)) ? bot.getLoopThreadId(mainChannelId)! : mainChannelId;
         if (notification.evalReport) {
           bot.postEvalEmbed(mainChannelId, notification.evalReport).catch((err: Error) => {
             log("warn", `postEvalEmbed failed (ns=${ns}):`, err.message);
