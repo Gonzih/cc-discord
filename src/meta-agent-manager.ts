@@ -197,7 +197,7 @@ export function spawnSession(ns: string, message: string, token: string, wire: W
 export interface MetaAgentManager {
   ensureWorkspace: (ns: string, repoUrl: string) => Promise<void>;
   injectMcp: (ns: string, token: string) => void;
-  startPolling: (wire: Wire, getNamespaces: () => string[]) => void;
+  startPolling: (wire: Wire, getNamespaces: () => Array<{ namespace: string; repoUrl: string }>) => void;
   stop: () => void;
 }
 
@@ -225,7 +225,7 @@ export function createMetaAgentManager(): MetaAgentManager {
         const namespaces = getNamespaces();
         if (namespaces.length === 0) return;
 
-        for (const ns of namespaces) {
+        for (const { namespace: ns, repoUrl } of namespaces) {
           if (activeNamespaces.has(ns)) continue;
 
           wire.discord.dequeue(ns)
@@ -264,6 +264,12 @@ export function createMetaAgentManager(): MetaAgentManager {
                 });
                 return;
               }
+
+              // Ensure the workspace directory exists — idempotent if already cloned.
+              // This guards against the workspace being absent after a bot restart.
+              const wsPath = workspacePath(ns);
+              await ensureWorkspace(ns, repoUrl);
+              injectMcp(ns, wsPath, token);
 
               spawnSession(ns, content, token, wire)
                 .catch((err: Error) => {
