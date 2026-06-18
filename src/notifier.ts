@@ -12,6 +12,7 @@
  */
 
 import { Redis } from "ioredis";
+import { createHash } from "crypto";
 import {
   discordChatLog,
   discordChatOutgoing,
@@ -26,6 +27,51 @@ import {
 import { splitLongMessage, stripAnsi } from "./formatter.js";
 import { parseEvalReport, type EvalReport } from "./loop-manager.js";
 import type { CcDiscordBot } from "./bot.js";
+
+/** Redis key for per-namespace notification dedup set */
+function dedupKey(ns: string): string {
+  return `cca:discord:sent:${ns}`;
+}
+
+/** Compute a short stable dedup fingerprint for a raw notification string */
+function notifFingerprint(raw: string): string {
+  return createHash("sha256").update(raw.slice(0, 500)).digest("hex").slice(0, 16);
+}
+
+/**
+ * Check whether this notification has already been forwarded for `ns` (Redis-backed dedup).
+ * If not, records it (SADD + EXPIRE 120s) and returns false (not a dup).
+ * Returns true if it's a duplicate and should be skipped.
+ */
+async function checkAndMarkSent(redis: Redis, ns: string, raw: string): Promise<boolean> {
+  const key = dedupKey(ns);
+  const fp = notifFingerprint(raw);
+  // SADD returns 1 if the element was added (new), 0 if already existed (dup)
+  const added = await redis.sadd(key, fp);
+  if (added === 0) return true; // duplicate
+  // Set/refresh the TTL on the set key
+  await redis.expire(key, 120);
+  return false;
+}
+
+/**
+ * In-memory dedup cache for pub/sub notifications (avoids async overhead on hot path).
+ * Maps fingerprint → expiry timestamp. Entries expire after 120 seconds.
+ */
+const inMemoryDedupCache = new Map<string, number>();
+const IN_MEMORY_DEDUP_TTL_MS = 120_000;
+
+function checkAndMarkSentSync(ns: string, raw: string): boolean {
+  const fp = `${ns}:${notifFingerprint(raw)}`;
+  const now = Date.now();
+  // Evict expired entries (keep cache small)
+  for (const [k, exp] of inMemoryDedupCache) {
+    if (now > exp) inMemoryDedupCache.delete(k);
+  }
+  if (inMemoryDedupCache.has(fp)) return true; // duplicate
+  inMemoryDedupCache.set(fp, now + IN_MEMORY_DEDUP_TTL_MS);
+  return false;
+}
 
 export interface ChatMessage {
   id: string;
@@ -362,6 +408,25 @@ export function startNotifier(
     for (const raw of items) {
       const notification = parseNotification(raw);
       if (notification === null) continue; // routing excludes discord
+
+      // Dedup: skip if this notification was already forwarded recently
+      // Uses Redis when available; falls back to in-memory dedup on Redis errors.
+      let isDup = false;
+      try {
+        if (typeof (redis as unknown as Record<string, unknown>).sadd === "function") {
+          isDup = await checkAndMarkSent(redis, ns, raw);
+        } else {
+          isDup = checkAndMarkSentSync(ns, raw);
+        }
+      } catch (err) {
+        log("warn", `dedup check failed (ns=${ns}), falling back to in-memory:`, (err as Error).message);
+        isDup = checkAndMarkSentSync(ns, raw);
+      }
+      if (isDup) {
+        log("info", `dedup: skipping already-sent notification (ns=${ns})`);
+        continue;
+      }
+
       // Primary namespace: honour chatId-based per-channel routing via reverseSnowflakeLookup,
       // then namespace → channelId lookup, then notifyChannelId / active channel.
       // Routed namespaces: always deliver to the registered Discord channelId — no leakage.
@@ -422,6 +487,13 @@ export function startNotifier(
     if (channel === notifyCh || channel === legacyNotifyCh) {
       const notification = parseNotification(message);
       if (notification === null) return; // routing excludes discord
+
+      // Synchronous in-memory dedup — keeps pub/sub handler synchronous
+      if (checkAndMarkSentSync(ns, message)) {
+        log("info", `dedup: skipping already-sent pub/sub notification (ns=${ns})`);
+        return;
+      }
+
       let mainChannelId: string | undefined;
       if (isPrimary) {
         mainChannelId = resolveNotifyChannel(notification.chatId, notifyChannelId, getActiveChannelId, reverseSnowflakeLookup, ns, getChannelIdForNamespace);
