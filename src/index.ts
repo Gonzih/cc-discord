@@ -21,6 +21,7 @@
  */
 
 import { createRequire } from "node:module";
+import { randomUUID } from "crypto";
 import { Redis } from "ioredis";
 import { createCcWire } from "@gonzih/cc-wire";
 import { CcDiscordBot } from "./bot.js";
@@ -91,12 +92,31 @@ sharedRedis.on("error", (err: Error) => {
 // cc-wire factory
 const wire = createCcWire(sharedRedis);
 
+// Singleton instance ID — used to detect stale processes after a restart
+const instanceId = randomUUID();
+const INSTANCE_KEY = "cca:discord:instance";
+const INSTANCE_TTL_MS = 30_000;
+const INSTANCE_REFRESH_MS = 10_000;
+
 sharedRedis.once("ready", () => {
   // Announce version
   sharedRedis.set(`cca:meta:cc-discord:version`, version).catch((err: Error) => {
     console.warn("[redis] failed to write version:", err.message);
   });
   console.log(`[cc-discord] version:reported ${version}`);
+
+  // Write singleton instance ID with 30s TTL
+  sharedRedis.set(INSTANCE_KEY, instanceId, "PX", INSTANCE_TTL_MS).catch((err: Error) => {
+    console.warn("[cc-discord] failed to write instance ID:", err.message);
+  });
+  console.log(`[cc-discord] instance:${instanceId}`);
+
+  // Refresh TTL every 10s so launchd-respawned processes displace old ones
+  setInterval(() => {
+    sharedRedis.set(INSTANCE_KEY, instanceId, "PX", INSTANCE_TTL_MS).catch((err: Error) => {
+      console.warn("[cc-discord] instance refresh failed:", err.message);
+    });
+  }, INSTANCE_REFRESH_MS);
 
   // Store master token so MetaAgentManager can retrieve it
   wire.token.setMaster(claudeToken!).catch((err: Error) => {
@@ -159,6 +179,7 @@ const bot = new CcDiscordBot({
   guildIds,
   redis: sharedRedis,
   namespace,
+  instanceId,
   registerRoutedChannelId: (ns, channelId) => notifier.registerRoutedChannelId(ns, channelId),
 });
 

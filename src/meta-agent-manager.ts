@@ -128,8 +128,21 @@ function resolveClaude(): string {
 }
 
 /**
+ * Redis keys for meta-agent stdout streaming.
+ * cca:meta:{ns}:stream — pub/sub channel (live streaming)
+ * cca:meta:{ns}:log    — list (history, capped at 2000)
+ */
+export function metaStreamChannel(ns: string): string {
+  return `cca:meta:${ns}:stream`;
+}
+export function metaLogKey(ns: string): string {
+  return `cca:meta:${ns}:log`;
+}
+
+/**
  * Spawn `claude --continue -p "{message}" --dangerously-skip-permissions` in the
  * namespace workspace. Pipes stdout line-by-line → wire.discord.publishOutgoing.
+ * Also streams each chunk to Redis: PUBLISH cca:meta:{ns}:stream and LPUSH cca:meta:{ns}:log.
  * Returns a Promise that resolves when the process exits.
  */
 export function spawnSession(ns: string, message: string, token: string, wire: Wire): Promise<void> {
@@ -152,6 +165,7 @@ export function spawnSession(ns: string, message: string, token: string, wire: W
         "--continue",
         "-p", message,
         "--output-format", "text",
+        "--verbose",
         "--dangerously-skip-permissions",
       ],
       { cwd: wsPath, env, stdio: ["ignore", "pipe", "pipe"] }
@@ -175,8 +189,29 @@ export function spawnSession(ns: string, message: string, token: string, wire: W
       });
     };
 
+    const rawRedis = wire._redis;
+    const streamToRedis = (chunk: string): void => {
+      const entry = JSON.stringify({ ts: Date.now(), ns, text: chunk });
+      const streamCh = metaStreamChannel(ns);
+      const logKey = metaLogKey(ns);
+      // Publish for live consumers (fire-and-forget)
+      rawRedis.publish(streamCh, entry).catch((err: Error) => {
+        console.warn(`[meta-agent-manager] stream publish failed (ns=${ns}):`, err.message);
+      });
+      // Persist to log list, cap at 2000
+      rawRedis.lpush(logKey, entry).then(() => {
+        rawRedis.ltrim(logKey, 0, 1999).catch(() => {});
+      }).catch((err: Error) => {
+        console.warn(`[meta-agent-manager] log lpush failed (ns=${ns}):`, err.message);
+      });
+    };
+
     proc.stdout.on("data", (chunk: Buffer) => {
-      lineBuffer += chunk.toString();
+      const chunkStr = chunk.toString();
+      // Stream raw chunk to Redis (before line-splitting)
+      streamToRedis(chunkStr);
+
+      lineBuffer += chunkStr;
       const lines = lineBuffer.split("\n");
       lineBuffer = lines.pop() ?? "";
       for (const line of lines) {
@@ -207,7 +242,11 @@ export function spawnSession(ns: string, message: string, token: string, wire: W
 export interface MetaAgentManager {
   ensureWorkspace: (ns: string, repoUrl: string) => Promise<void>;
   injectMcp: (ns: string, token: string) => void;
-  startPolling: (wire: Wire, getNamespaces: () => Array<{ namespace: string; repoUrl: string }>) => void;
+  startPolling: (
+    wire: Wire,
+    getNamespaces: () => Array<{ namespace: string; repoUrl: string }>,
+    instanceId?: string
+  ) => void;
   stop: () => void;
 }
 
@@ -228,8 +267,10 @@ export function createMetaAgentManager(): MetaAgentManager {
       injectMcp(ns, wsPath, token);
     },
 
-    startPolling(wire, getNamespaces) {
+    startPolling(wire, getNamespaces, instanceId) {
       if (pollInterval) return; // already running
+
+      const INSTANCE_KEY = "cca:discord:instance";
 
       pollInterval = setInterval(() => {
         const namespaces = getNamespaces();
@@ -241,6 +282,19 @@ export function createMetaAgentManager(): MetaAgentManager {
           wire.discord.dequeue(ns)
             .then(async (msg) => {
               if (!msg) return;
+
+              // Staleness check: if a newer instance has registered, this process is stale — exit.
+              if (instanceId) {
+                try {
+                  const current = await wire._redis.get(INSTANCE_KEY);
+                  if (current && current !== instanceId) {
+                    console.log(`[meta-agent-manager] stale instance detected (current=${current}, ours=${instanceId}) — exiting`);
+                    process.exit(0);
+                  }
+                } catch {
+                  // Redis error — proceed anyway
+                }
+              }
               const content = typeof msg === "string" ? msg : (msg as { content?: string }).content ?? String(msg);
 
               activeNamespaces.add(ns);
