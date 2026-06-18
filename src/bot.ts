@@ -26,8 +26,9 @@ import {
   VoiceChannel,
   ChannelType,
 } from "discord.js";
-import { existsSync, createWriteStream, mkdirSync, statSync } from "fs";
+import { existsSync, createWriteStream, mkdirSync, statSync, readdirSync, rmSync } from "fs";
 import { resolve, basename, join } from "path";
+import { homedir } from "os";
 import https from "https";
 import http from "http";
 import { Redis } from "ioredis";
@@ -181,6 +182,8 @@ export interface DiscordBotOptions {
   redis?: Redis;
   namespace?: string;
   guildIds?: string[];
+  /** Instance ID for singleton overlap detection */
+  instanceId?: string;
   /** Called when a message is routed to a non-default namespace so the notifier
    *  can forward the response back to the originating Discord channel. */
   registerRoutedChannelId?: (namespace: string, channelId: string) => void;
@@ -975,6 +978,15 @@ export class CcDiscordBot {
         .addStringOption((opt) =>
           opt.setName("repo").setDescription("GitHub repo URL (e.g. https://github.com/org/repo)").setRequired(true)
         ),
+      new SlashCommandBuilder()
+        .setName("restart")
+        .setDescription("Graceful restart — exits this process (launchd will respawn clean)"),
+      new SlashCommandBuilder()
+        .setName("clear")
+        .setDescription("Clear the Claude session context for this channel's namespace"),
+      new SlashCommandBuilder()
+        .setName("compact")
+        .setDescription("Compact the Claude session context for this channel's namespace"),
     ].map((cmd) => cmd.toJSON());
 
     const rest = new REST().setToken(this.opts.discordToken);
@@ -1102,6 +1114,32 @@ export class CcDiscordBot {
         } catch (err) {
           await interaction.editReply(`Failed to create channel: ${(err as Error).message}`);
         }
+        break;
+      }
+
+      case "restart": {
+        await interaction.reply("Restarting...");
+        setTimeout(() => { process.exit(0); }, 500);
+        break;
+      }
+
+      case "clear": {
+        const ns = this.resolveNamespaceForChannel(channelId);
+        const deleted = this.clearClaudeSession(ns);
+        await interaction.reply(
+          deleted > 0
+            ? `Context cleared for ${ns} (${deleted} session file${deleted === 1 ? "" : "s"} removed). Next message starts fresh.`
+            : `No active session files found for ${ns}.`
+        );
+        break;
+      }
+
+      case "compact": {
+        const ns = this.resolveNamespaceForChannel(channelId);
+        await interaction.reply(`Compacting context for ${ns}...`);
+        this.compactClaudeSession(ns).catch((err: Error) => {
+          console.warn(`[bot] /compact failed (ns=${ns}):`, err.message);
+        });
         break;
       }
     }
@@ -1490,9 +1528,99 @@ export class CcDiscordBot {
    */
   public startMetaAgentPolling(): void {
     if (!this.wire) return;
-    this.metaAgentManager.startPolling(this.wire, () =>
-      Array.from(this.channelNamespaceMap.values())
+    this.metaAgentManager.startPolling(
+      this.wire,
+      () => Array.from(this.channelNamespaceMap.values()),
+      this.opts.instanceId
     );
+  }
+
+  /**
+   * Resolve the namespace for a given channelId.
+   * Routed channels use their registered namespace; everything else uses the bot's primary namespace.
+   */
+  private resolveNamespaceForChannel(channelId: string): string {
+    return this.channelNamespaceMap.get(channelId)?.namespace ?? this.namespace;
+  }
+
+  /**
+   * Delete all Claude session JSONL files for the given namespace's workspace.
+   * Claude stores sessions in ~/.claude/projects/{encoded-workspace-path}/*.jsonl
+   * The path encoding replaces / with - and prepends a leading -.
+   * Returns the number of files deleted.
+   */
+  private clearClaudeSession(ns: string): number {
+    const wsPath = join(homedir(), "cc-discord-workspace", ns);
+    // Claude encodes workspace path: strip leading /, replace / with -, then prepend -
+    const encoded = "-" + wsPath.slice(1).replace(/\//g, "-");
+    const projectsDir = join(homedir(), ".claude", "projects", encoded);
+    if (!existsSync(projectsDir)) return 0;
+    let count = 0;
+    try {
+      const entries = readdirSync(projectsDir);
+      for (const entry of entries) {
+        if (entry.endsWith(".jsonl")) {
+          rmSync(join(projectsDir, entry), { force: true });
+          count++;
+        }
+      }
+    } catch (err) {
+      console.warn(`[bot] clearClaudeSession(${ns}) failed:`, (err as Error).message);
+    }
+    console.log(`[bot] clearClaudeSession(${ns}): deleted ${count} files from ${projectsDir}`);
+    return count;
+  }
+
+  /**
+   * Send /compact as a prompt to a one-shot claude --continue session in the namespace workspace.
+   * This triggers Claude's built-in context compaction.
+   */
+  private async compactClaudeSession(ns: string): Promise<void> {
+    const wsPath = join(homedir(), "cc-discord-workspace", ns);
+    if (!existsSync(wsPath)) {
+      console.warn(`[bot] compactClaudeSession(${ns}): workspace not found at ${wsPath}`);
+      return;
+    }
+    const token = await this.resolveToken();
+    const { spawn } = await import("child_process");
+    const { existsSync: fsExists } = await import("fs");
+
+    const resolveBin = (): string => {
+      const dirs = (process.env.PATH ?? "").split(":");
+      for (const dir of dirs) {
+        const c = `${dir}/claude`;
+        if (fsExists(c)) return c;
+      }
+      for (const p of [`${homedir()}/.npm-global/bin/claude`, "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]) {
+        if (fsExists(p)) return p;
+      }
+      return "claude";
+    };
+
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (token.startsWith("sk-ant-api")) {
+      env.ANTHROPIC_API_KEY = token;
+      delete env.CLAUDE_CODE_OAUTH_TOKEN;
+    } else {
+      env.CLAUDE_CODE_OAUTH_TOKEN = token;
+      delete env.ANTHROPIC_API_KEY;
+    }
+
+    return new Promise((resolve) => {
+      const proc = spawn(
+        resolveBin(),
+        ["--continue", "-p", "/compact", "--output-format", "text", "--dangerously-skip-permissions"],
+        { cwd: wsPath, env, stdio: ["ignore", "pipe", "pipe"] }
+      );
+      proc.on("exit", (code) => {
+        console.log(`[bot] compactClaudeSession(${ns}) exited code=${code}`);
+        resolve();
+      });
+      proc.on("error", (err) => {
+        console.warn(`[bot] compactClaudeSession(${ns}) spawn error:`, err.message);
+        resolve();
+      });
+    });
   }
 
   public stop(): void {
