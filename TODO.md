@@ -1,11 +1,8 @@
-# TODO: loop observability layer
+# TODO: reduce Discord noise
 
-- [x] git checkout -b feat/loop-observability
-- [ ] src/loop-manager.ts — create LoopState, GateFailure, EvalReport, LoopManager, isGoalMessage, parseEvalReport
-- [ ] src/bot.ts — add GuildMessageReactions intent, LoopManager field, handleReactionAdd, createLoopThread, getLoopThreadId, postEvalEmbed, modify handleMessage for loop detection + thread routing
-- [ ] src/notifier.ts — extend ParsedNotification with evalReport, update parseNotification, thread routing in flushMetaAgentBuffer / pollOneNamespace / pubsub handler
-- [ ] src/loop-manager.test.ts — unit tests for isGoalMessage, parseEvalReport, LoopManager
-- [ ] src/notifier.test.ts — tests for eval_report parsing and thread routing
+- [ ] Fix 1: add cron-fire filter in parseNotification (return null for is_cron+⏰ prefix)
+- [ ] Fix 2: add length gate in flushMetaAgentBuffer (skip rawText.length < 20)
+- [ ] Add tests for both new behaviors in notifier.test.ts
 - [ ] npm test — all pass
 - [ ] git diff --staged — verify
 - [ ] git commit + push

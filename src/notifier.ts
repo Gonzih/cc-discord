@@ -77,6 +77,8 @@ export function parseNotification(raw: string): ParsedNotification | null {
   let isCron = false;
   try {
     const parsed = JSON.parse(raw) as NotificationPayload & { is_cron?: boolean };
+    // Drop cron-fire pings (⏰ …) — job completion notifications (✅/❌) still pass through
+    if (parsed.is_cron === true && parsed.text?.startsWith("⏰")) return null;
     // routing: absent/empty → all transports; non-empty → only listed transports
     if (parsed.routing && parsed.routing.length > 0 && !parsed.routing.includes("discord" as Transport)) {
       return null;
@@ -278,9 +280,11 @@ export function startNotifier(
     bot.stopMetaAgentTyping(loopThreadId ?? targetChannelId);
     const buf = metaAgentBuffers.get(ns);
     if (!buf || !buf.text.trim()) return;
-    const text = `← [${ns}] ` + stripAnsi(buf.text.trim());
+    const rawText = stripAnsi(buf.text.trim());
     buf.text = "";
     buf.timer = null;
+    if (rawText.length < 20) return;
+    const text = `← [${ns}] ` + rawText;
     // During an active loop, route meta-agent output to the thread rather than main channel
     const deliverTo = bot.getLoopThreadId(targetChannelId) ?? targetChannelId;
     const chunks = splitLongMessage(text);

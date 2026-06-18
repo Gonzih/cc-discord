@@ -49,52 +49,54 @@ describe("resolveNotifyChannel", () => {
 
 describe("parseNotification", () => {
   it("returns raw string when not JSON", () => {
-    expect(parseNotification("plain text")).toEqual({ text: "plain text" });
+    expect(parseNotification("plain text")).toMatchObject({ text: "plain text" });
   });
 
   it("extracts text from JSON payload", () => {
     const payload = JSON.stringify({ text: "job done" });
-    expect(parseNotification(payload)).toEqual({ text: "job done" });
+    expect(parseNotification(payload)).toMatchObject({ text: "job done" });
   });
 
   it("appends driver badge when driver is present", () => {
     const payload = JSON.stringify({ text: "done", driver: "claude" });
-    expect(parseNotification(payload)).toEqual({ text: "done\n[claude]" });
+    expect(parseNotification(payload)).toMatchObject({ text: "done\n[claude]" });
   });
 
   it("appends driver:model badge when both present", () => {
     const payload = JSON.stringify({ text: "done", driver: "claude", model: "claude-sonnet-4-6" });
-    expect(parseNotification(payload)).toEqual({ text: "done\n[claude:sonnet-4-6]" });
+    expect(parseNotification(payload)).toMatchObject({ text: "done\n[claude:sonnet-4-6]" });
   });
 
   it("appends cost when numeric cost present", () => {
     const payload = JSON.stringify({ text: "done", driver: "claude", cost: 0.123 });
-    expect(parseNotification(payload)).toEqual({ text: "done\n[claude] cost: $0.123" });
+    expect(parseNotification(payload)).toMatchObject({ text: "done\n[claude] cost: $0.123" });
   });
 
   it("strips vendor prefix from openrouter-style model names", () => {
     const payload = JSON.stringify({ text: "done", driver: "openrouter", model: "openai/gpt-4o" });
-    expect(parseNotification(payload)).toEqual({ text: "done\n[openrouter:gpt-4o]" });
+    expect(parseNotification(payload)).toMatchObject({ text: "done\n[openrouter:gpt-4o]" });
   });
 
   it("returns text unchanged when no driver", () => {
     const payload = JSON.stringify({ text: "just text", model: "gpt-4" });
-    expect(parseNotification(payload)).toEqual({ text: "just text" });
+    expect(parseNotification(payload)).toMatchObject({ text: "just text" });
   });
 
   it("extracts chat_id from JSON payload", () => {
     const payload = JSON.stringify({ text: "job done", chat_id: 12345 });
-    expect(parseNotification(payload)).toEqual({ text: "job done", chatId: 12345 });
+    expect(parseNotification(payload)).toMatchObject({ text: "job done", chatId: 12345 });
   });
 
   it("ignores zero chat_id", () => {
     const payload = JSON.stringify({ text: "job done", chat_id: 0 });
-    expect(parseNotification(payload)).toEqual({ text: "job done" });
+    const result = parseNotification(payload);
+    expect(result).toMatchObject({ text: "job done" });
+    expect(result?.chatId).toBeUndefined();
   });
 
   it("extracts chat_id alongside driver badge", () => {
     const payload = JSON.stringify({ text: "done", driver: "claude", chat_id: 99 });
-    expect(parseNotification(payload)).toEqual({ text: "done\n[claude]", chatId: 99 });
+    expect(parseNotification(payload)).toMatchObject({ text: "done\n[claude]", chatId: 99 });
   });
 
   it("returns null when routing excludes discord", () => {
@@ -104,22 +106,22 @@ describe("parseNotification", () => {
 
   it("delivers when routing includes discord", () => {
     const payload = JSON.stringify({ text: "done", routing: ["discord"] });
-    expect(parseNotification(payload)).toEqual({ text: "done" });
+    expect(parseNotification(payload)).toMatchObject({ text: "done" });
   });
 
   it("delivers when routing includes discord alongside other transports", () => {
     const payload = JSON.stringify({ text: "done", routing: ["discord", "telegram"] });
-    expect(parseNotification(payload)).toEqual({ text: "done" });
+    expect(parseNotification(payload)).toMatchObject({ text: "done" });
   });
 
   it("delivers when routing is absent", () => {
     const payload = JSON.stringify({ text: "done" });
-    expect(parseNotification(payload)).toEqual({ text: "done" });
+    expect(parseNotification(payload)).toMatchObject({ text: "done" });
   });
 
   it("delivers when routing is an empty array", () => {
     const payload = JSON.stringify({ text: "done", routing: [] });
-    expect(parseNotification(payload)).toEqual({ text: "done" });
+    expect(parseNotification(payload)).toMatchObject({ text: "done" });
   });
 });
 
@@ -131,6 +133,10 @@ function buildMocks(loopThreadMap?: Map<string, string>) {
   const evalEmbeds: Array<{ channelId: string; report: unknown }> = [];
   const mockBot = {
     sendToChannelById: vi.fn((channelId: string, text: string) => {
+      sent.push({ channelId, text });
+      return Promise.resolve();
+    }),
+    sendWithFileDetection: vi.fn((channelId: string, text: string) => {
       sent.push({ channelId, text });
       return Promise.resolve();
     }),
@@ -202,7 +208,7 @@ describe("startNotifier — pmessage (cca:discord:chat:outgoing:*)", () => {
       mockRedis as never,
     );
 
-    const msg = JSON.stringify({ source: "claude", content: "cron response" });
+    const msg = JSON.stringify({ source: "claude", content: "this is a long enough cron response" });
     mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), msg);
 
     await vi.advanceTimersByTimeAsync(2_000);
@@ -224,7 +230,7 @@ describe("startNotifier — pmessage (cca:discord:chat:outgoing:*)", () => {
 
     handle.registerRoutedChannelId("simorgh", "discord-ch-555");
 
-    const msg = JSON.stringify({ source: "claude", content: "routed response" });
+    const msg = JSON.stringify({ source: "claude", content: "this is a long enough routed response" });
     mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("simorgh"), msg);
 
     await vi.advanceTimersByTimeAsync(2_000);
@@ -246,7 +252,7 @@ describe("startNotifier — pmessage (cca:discord:chat:outgoing:*)", () => {
 
     handle.registerRoutedChannelId("simorgh", "discord-ch-888");
 
-    const msg = JSON.stringify({ source: "claude", content: "agent reply" });
+    const msg = JSON.stringify({ source: "claude", content: "this is a long enough agent reply" });
     mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("simorgh"), msg);
 
     await vi.advanceTimersByTimeAsync(2_000);
@@ -423,7 +429,7 @@ describe("startNotifier — legacy notifyChannel (cca:notify:{ns}) pub/sub", () 
     expect(sent.every((m) => m.channelId !== "dead-notify-ch")).toBe(true);
   });
 
-  it("calls forwardNotification when legacy channel delivers a notification", () => {
+  it("calls handleUserMessage when legacy channel delivers a notification", () => {
     const { mockBot, mockSub, mockRedis } = buildMocks();
     const forwarded: Array<{ channelId: string; text: string }> = [];
 
@@ -432,8 +438,7 @@ describe("startNotifier — legacy notifyChannel (cca:notify:{ns}) pub/sub", () 
       "primary-notify-ch",
       "money-brain",
       mockRedis as never,
-      undefined,
-      (channelId, text) => forwarded.push({ channelId, text }),
+      (channelId, text) => forwarded.push({ channelId, text }),  // handleUserMessage (5th arg)
     );
 
     mockSub.emit("message", notifyChannel("money-brain"), "legacy plain text");
@@ -461,6 +466,128 @@ describe("parseNotification — eval_report", () => {
   it("returns evalReport=undefined for plain text (non-JSON) notifications", () => {
     const result = parseNotification("plain text message");
     expect(result?.evalReport).toBeUndefined();
+  });
+});
+
+describe("parseNotification — cron-fire filter", () => {
+  it("returns null for is_cron=true notifications whose text starts with ⏰", () => {
+    const payload = JSON.stringify({ text: "⏰ cron fired: every 30m", is_cron: true });
+    expect(parseNotification(payload)).toBeNull();
+  });
+
+  it("returns null for is_cron=true even with other fields present", () => {
+    const payload = JSON.stringify({ text: "⏰ cron fired: every 5m", is_cron: true, driver: "claude" });
+    expect(parseNotification(payload)).toBeNull();
+  });
+
+  it("passes through is_cron=true notifications whose text starts with ✅ (job completion)", () => {
+    const payload = JSON.stringify({ text: "✅ job complete", is_cron: true });
+    const result = parseNotification(payload);
+    expect(result).not.toBeNull();
+    expect(result?.isCron).toBe(true);
+  });
+
+  it("passes through is_cron=true notifications whose text starts with ❌ (job failure)", () => {
+    const payload = JSON.stringify({ text: "❌ job failed", is_cron: true });
+    const result = parseNotification(payload);
+    expect(result).not.toBeNull();
+    expect(result?.isCron).toBe(true);
+  });
+
+  it("passes through is_cron=false notifications with ⏰ text (not a cron fire)", () => {
+    const payload = JSON.stringify({ text: "⏰ some other text", is_cron: false });
+    const result = parseNotification(payload);
+    expect(result).not.toBeNull();
+  });
+
+  it("passes through notifications with no is_cron field", () => {
+    const payload = JSON.stringify({ text: "⏰ manual trigger" });
+    const result = parseNotification(payload);
+    expect(result).not.toBeNull();
+  });
+});
+
+describe("startNotifier — short meta-agent response filter", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does not send meta-agent output shorter than 20 chars", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    const msg = JSON.stringify({ source: "claude", content: "Done." });
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), msg);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(sent).toHaveLength(0);
+  });
+
+  it("does not send exactly-19-char meta-agent output", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    // 19 chars: "1234567890123456789"
+    const msg = JSON.stringify({ source: "claude", content: "1234567890123456789" });
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), msg);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(sent).toHaveLength(0);
+  });
+
+  it("sends meta-agent output of exactly 20 chars", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    // 20 chars: "12345678901234567890"
+    const msg = JSON.stringify({ source: "claude", content: "12345678901234567890" });
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), msg);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(sent).toHaveLength(1);
+  });
+
+  it("still calls stopMetaAgentTyping even when content is too short to send", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockSub, mockRedis, stoppedTyping } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    const msg = JSON.stringify({ source: "claude", content: "Quiet." });
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), msg);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(stoppedTyping).toContain("primary-notify-ch");
   });
 });
 
@@ -548,7 +675,7 @@ describe("startNotifier — loop thread routing", () => {
       mockRedis as never,
     );
 
-    const msg = JSON.stringify({ source: "claude", content: "loop step output" });
+    const msg = JSON.stringify({ source: "claude", content: "this is a long enough loop step output" });
     mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), msg);
 
     await vi.advanceTimersByTimeAsync(2_000);
