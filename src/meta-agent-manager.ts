@@ -45,6 +45,12 @@ export async function ensureWorkspace(ns: string, repoUrl: string): Promise<void
   console.log(`[meta-agent-manager] cloning ${repoUrl} → ${wsPath}`);
   execSync(`git clone ${repoUrl} ${wsPath}`, { stdio: "pipe" });
   console.log(`[meta-agent-manager] clone complete for namespace=${ns}`);
+  try {
+    execSync(`/opt/homebrew/bin/git-kb init`, { cwd: wsPath, stdio: "pipe" });
+    console.log(`[meta-agent-manager] gitkb initialized for namespace=${ns}`);
+  } catch (err) {
+    console.warn(`[meta-agent-manager] gitkb init failed (ns=${ns}):`, (err as Error).message);
+  }
 }
 
 /**
@@ -76,6 +82,10 @@ export function injectMcp(ns: string, wsPath: string, token: string): void {
 
   const config = {
     mcpServers: {
+      "gitkb": {
+        command: "/opt/homebrew/bin/git-kb",
+        args: ["mcp"],
+      },
       "cc-agent": {
         command: "/opt/homebrew/bin/npx",
         args: ["-y", "--prefer-online", "@gonzih/cc-agent"],
