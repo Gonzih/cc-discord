@@ -1491,7 +1491,7 @@ export class CcDiscordBot {
   public startMetaAgentPolling(): void {
     if (!this.wire) return;
     this.metaAgentManager.startPolling(this.wire, () =>
-      Array.from(this.channelNamespaceMap.values()).map((v) => v.namespace)
+      Array.from(this.channelNamespaceMap.values())
     );
   }
 
