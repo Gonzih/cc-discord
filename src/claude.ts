@@ -231,9 +231,12 @@ export function extractText(msg: ClaudeMessage): string {
 
 /**
  * Resolve the claude CLI binary path.
- * Checks PATH entries + common npm global install locations.
+ * Checks CLAUDE_BIN env var first, then PATH entries + common npm global install locations.
  */
 function resolveClaude(pathEnv?: string): string {
+  // Allow test/operator override via CLAUDE_BIN
+  if (process.env.CLAUDE_BIN) return process.env.CLAUDE_BIN;
+
   // Try PATH entries first
   const dirs = (pathEnv ?? process.env.PATH ?? "").split(":");
   for (const dir of dirs) {
