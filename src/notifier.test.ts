@@ -132,6 +132,22 @@ describe("parseNotification", () => {
     const payload = JSON.stringify({ text: "job complete", is_cron: false });
     expect(parseNotification(payload)).toMatchObject({ text: "job complete", isCron: false });
   });
+
+  it("returns null for plain-text ⏰ cron-fire notifications", () => {
+    expect(parseNotification("⏰ cron fired: every 30m")).toBeNull();
+  });
+
+  it("returns null for JSON-wrapped ⏰ cron-fire notifications", () => {
+    expect(parseNotification(JSON.stringify({ text: "⏰ cron fired: every 30m" }))).toBeNull();
+  });
+
+  it("does not filter notifications that merely mention ⏰ mid-text", () => {
+    // Only leading ⏰ (plain-text) or JSON-string ⏰ is filtered;
+    // a JSON payload whose *raw* string starts with { is not plain-text
+    const payload = JSON.stringify({ text: "done", note: "scheduled via ⏰" });
+    // raw.includes('"⏰') is false here because the value contains ' ⏰', not '"⏰'
+    expect(parseNotification(payload)).not.toBeNull();
+  });
 });
 
 /** Build the minimal mocks needed to call startNotifier without a real Redis or Discord client. */
