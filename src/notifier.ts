@@ -115,6 +115,8 @@ export interface ParsedNotification {
  * Appends " cost: $X.XXX" if a numeric cost field is present.
  */
 export function parseNotification(raw: string): ParsedNotification | null {
+  // Filter cron-fire noise before any parsing — catches plain-text and JSON-wrapped ⏰ cron notifications
+  if (raw.startsWith("⏰") || raw.includes('"⏰')) return null;
   let text = raw;
   let driver: string | undefined;
   let model: string | undefined;
@@ -135,9 +137,8 @@ export function parseNotification(raw: string): ParsedNotification | null {
     if (typeof parsed.chat_id === "number" && parsed.chat_id !== 0) chatId = parsed.chat_id;
     if (typeof parsed.is_cron === "boolean") isCron = parsed.is_cron;
   } catch {
-    // non-JSON: fall through to text-based check below
+    // non-JSON: fall through
   }
-  if (text.startsWith("⏰")) return null;
 
   // Parse eval_report if present — this field is non-standard and not in NotificationPayload type
   const evalReport = parseEvalReport(raw);
