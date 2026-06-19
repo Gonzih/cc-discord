@@ -128,7 +128,6 @@ export function parseNotification(raw: string): ParsedNotification | null {
       return null;
     }
     if (parsed.is_cron === true) return null;
-    if (parsed.text?.startsWith("⏰")) return null;
     if (parsed.text) text = parsed.text;
     driver = parsed.driver;
     model = parsed.model;
@@ -136,8 +135,9 @@ export function parseNotification(raw: string): ParsedNotification | null {
     if (typeof parsed.chat_id === "number" && parsed.chat_id !== 0) chatId = parsed.chat_id;
     if (typeof parsed.is_cron === "boolean") isCron = parsed.is_cron;
   } catch {
-    return { text, isCron };
+    // non-JSON: fall through to text-based check below
   }
+  if (text.startsWith("⏰")) return null;
 
   // Parse eval_report if present — this field is non-standard and not in NotificationPayload type
   const evalReport = parseEvalReport(raw);
