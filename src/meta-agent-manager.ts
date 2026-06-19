@@ -108,8 +108,12 @@ export function injectMcp(ns: string, wsPath: string, token: string): void {
 
 /**
  * Resolve claude binary — same logic as claude.ts resolveClaude.
+ * Checks CLAUDE_BIN env var first, then PATH + common fallback locations.
  */
 function resolveClaude(): string {
+  // Allow test/operator override via CLAUDE_BIN
+  if (process.env.CLAUDE_BIN) return process.env.CLAUDE_BIN;
+
   const dirs = (process.env.PATH ?? "").split(":");
   for (const dir of dirs) {
     const c = `${dir}/claude`;
