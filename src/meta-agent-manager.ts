@@ -77,7 +77,7 @@ export function injectMcp(ns: string, wsPath: string, token: string): void {
   }
 
   const npmCache = process.env.npm_config_cache ?? `${homedir()}/.npm`;
-  const trustedOwners = process.env.CC_AGENT_TRUSTED_OWNERS ?? "";
+  const trustedOwners = process.env.CC_AGENT_TRUSTED_OWNERS ?? "gonzih,ecoclaw,simorgh-app";
   const systemPath = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin";
 
   const config = {
