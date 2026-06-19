@@ -12,7 +12,8 @@
     "dev": "node --loader ts-node/esm src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "test:integration": "CLAUDE_BIN=./test/fixtures/mock-claude.js vitest run test/integration/"
   },
   "files": [
     "dist/"
