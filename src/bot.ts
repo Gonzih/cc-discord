@@ -40,6 +40,7 @@ import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./to
 import { writeChatLog, type ChatMessage } from "./notifier.js";
 import { LoopManager, isGoalMessage, type EvalReport } from "./loop-manager.js";
 import { CronManager } from "./cron.js";
+import { CronEngine } from "./cron-engine.js";
 import { parseChannelCreateIntent, routeToMetaAgent } from "./router.js";
 import { createMetaAgentManager, type MetaAgentManager } from "./meta-agent-manager.js";
 
@@ -202,6 +203,7 @@ export class CcDiscordBot {
   private namespace: string;
   private lastActiveChannelId?: string;
   private cron: CronManager;
+  private cronEngine?: CronEngine;
   private metaAgentManager: MetaAgentManager;
   /** ClaudeProcess running the MCP tool bridge (for callCcAgentTool) */
   private mcpSession?: ClaudeProcess;
@@ -215,6 +217,7 @@ export class CcDiscordBot {
     if (opts.redis) {
       this.wire = createCcWire(opts.redis);
       this.loopManager = new LoopManager(opts.redis);
+      this.cronEngine = new CronEngine(opts.redis);
     }
     this.metaAgentManager = createMetaAgentManager();
 
@@ -987,6 +990,44 @@ export class CcDiscordBot {
       new SlashCommandBuilder()
         .setName("compact")
         .setDescription("Compact the Claude session context for this channel's namespace"),
+      new SlashCommandBuilder()
+        .setName("cron")
+        .setDescription("Manage Redis-persisted cron jobs for this channel's namespace")
+        .addSubcommand((sub) =>
+          sub
+            .setName("add")
+            .setDescription("Add a cron job (standard 5-field cron expression)")
+            .addStringOption((opt) =>
+              opt.setName("schedule").setDescription("Cron expression e.g. '0 * * * *'").setRequired(true)
+            )
+            .addStringOption((opt) =>
+              opt.setName("message").setDescription("Message to push to the meta-agent input queue").setRequired(true)
+            )
+            .addIntegerOption((opt) =>
+              opt.setName("compact_every").setDescription("Push /compact every N fires (default: 10, 0 = never)").setRequired(false)
+            )
+        )
+        .addSubcommand((sub) =>
+          sub.setName("list").setDescription("List all cron jobs")
+        )
+        .addSubcommand((sub) =>
+          sub
+            .setName("pause")
+            .setDescription("Pause a cron job")
+            .addStringOption((opt) => opt.setName("id").setDescription("Cron ID").setRequired(true))
+        )
+        .addSubcommand((sub) =>
+          sub
+            .setName("resume")
+            .setDescription("Resume a paused cron job")
+            .addStringOption((opt) => opt.setName("id").setDescription("Cron ID").setRequired(true))
+        )
+        .addSubcommand((sub) =>
+          sub
+            .setName("delete")
+            .setDescription("Delete a cron job permanently")
+            .addStringOption((opt) => opt.setName("id").setDescription("Cron ID").setRequired(true))
+        ),
     ].map((cmd) => cmd.toJSON());
 
     const rest = new REST().setToken(this.opts.discordToken);
@@ -1142,6 +1183,11 @@ export class CcDiscordBot {
         });
         break;
       }
+
+      case "cron": {
+        await this.handleCronEngineCommand(interaction, channelId);
+        break;
+      }
     }
   }
 
@@ -1188,6 +1234,91 @@ export class CcDiscordBot {
       }
       default:
         await interaction.reply("Unknown subcommand.");
+    }
+  }
+
+  /**
+   * Handle the /cron command group — backed by CronEngine (Redis-persisted, node-cron scheduled).
+   * Namespace is derived from the channel's registered namespace (same pattern as /clear and /compact).
+   */
+  private async handleCronEngineCommand(interaction: ChatInputCommandInteraction, channelId: string): Promise<void> {
+    if (!this.cronEngine) {
+      await interaction.reply({ content: "Cron engine unavailable (no Redis connection).", ephemeral: true });
+      return;
+    }
+
+    const ns = this.resolveNamespaceForChannel(channelId);
+    const sub = interaction.options.getSubcommand();
+
+    switch (sub) {
+      case "add": {
+        const cronSchedule = interaction.options.getString("schedule", true);
+        const message = interaction.options.getString("message", true);
+        const compactEvery = interaction.options.getInteger("compact_every") ?? 10;
+        await interaction.deferReply();
+        const rec = await this.cronEngine.add(ns, cronSchedule, message, compactEvery);
+        if (!rec) {
+          await interaction.editReply(
+            `Invalid cron expression: \`${cronSchedule}\`\nUse standard 5-field format, e.g. \`0 * * * *\` (hourly) or \`*/30 * * * *\` (every 30 min).`
+          );
+        } else {
+          await interaction.editReply(
+            `Cron added for namespace **${ns}**\nID: \`${rec.id}\`\nSchedule: \`${rec.schedule}\`\nCompact every: ${rec.compact_every} fires`
+          );
+        }
+        break;
+      }
+
+      case "list": {
+        await interaction.deferReply();
+        const allCrons = await this.cronEngine.list();
+        const nsCrons = allCrons.filter((r) => r.namespace === ns);
+        if (nsCrons.length === 0) {
+          await interaction.editReply(`No cron jobs for namespace **${ns}**.`);
+        } else {
+          const embed = new EmbedBuilder()
+            .setTitle(`Cron jobs — ${ns}`)
+            .setColor(0x5865F2)
+            .setDescription(
+              nsCrons
+                .map((r) => {
+                  const status = r.enabled ? "enabled" : "paused";
+                  const last = r.last_fired_at ? `last fired ${r.last_fired_at}` : "never fired";
+                  return `**\`${r.id}\`** [${status}]\nSchedule: \`${r.schedule}\` | Fires: ${r.fire_count} | ${last}\nMessage: \`${r.message.slice(0, 80)}${r.message.length > 80 ? "…" : ""}\``;
+                })
+                .join("\n\n")
+            );
+          await interaction.editReply({ embeds: [embed] });
+        }
+        break;
+      }
+
+      case "pause": {
+        const id = interaction.options.getString("id", true);
+        await interaction.deferReply();
+        const ok = await this.cronEngine.pause(id);
+        await interaction.editReply(ok ? `Cron \`${id}\` paused.` : `Cron \`${id}\` not found.`);
+        break;
+      }
+
+      case "resume": {
+        const id = interaction.options.getString("id", true);
+        await interaction.deferReply();
+        const ok = await this.cronEngine.resume(id);
+        await interaction.editReply(ok ? `Cron \`${id}\` resumed.` : `Cron \`${id}\` not found.`);
+        break;
+      }
+
+      case "delete": {
+        const id = interaction.options.getString("id", true);
+        await interaction.deferReply();
+        const ok = await this.cronEngine.delete(id);
+        await interaction.editReply(ok ? `Cron \`${id}\` deleted.` : `Cron \`${id}\` not found.`);
+        break;
+      }
+
+      default:
+        await interaction.reply("Unknown /cron subcommand.");
     }
   }
 
@@ -1533,6 +1664,17 @@ export class CcDiscordBot {
       () => Array.from(this.channelNamespaceMap.values()),
       this.opts.instanceId
     );
+  }
+
+  /**
+   * Start the CronEngine — loads all enabled crons from Redis and schedules them.
+   * Called from index.ts after startup migrations complete (alongside startMetaAgentPolling).
+   */
+  public startCronEngine(): void {
+    if (!this.cronEngine) return;
+    this.cronEngine.start().catch((err: Error) => {
+      console.warn("[bot] cronEngine.start() failed:", err.message);
+    });
   }
 
   /**
