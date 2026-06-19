@@ -164,6 +164,9 @@ async function runStartupMigrations(): Promise<void> {
 
   // 3. Start meta-agent polling now that data is migrated
   bot.startMetaAgentPolling();
+
+  // 4. Start cron engine — loads and schedules all Redis-persisted crons
+  bot.startCronEngine();
 }
 
 // Mutable placeholder closures — filled in once `bot` is created below
