@@ -128,6 +128,7 @@ export function parseNotification(raw: string): ParsedNotification | null {
       return null;
     }
     if (parsed.is_cron === true) return null;
+    if (parsed.text?.startsWith("⏰")) return null;
     if (parsed.text) text = parsed.text;
     driver = parsed.driver;
     model = parsed.model;
