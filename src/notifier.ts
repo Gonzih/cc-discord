@@ -150,13 +150,16 @@ export function parseNotification(raw: string): ParsedNotification | null {
   let chatId: number | undefined;
   let isCron = false;
   try {
-    const parsed = JSON.parse(raw) as NotificationPayload & { is_cron?: boolean };
+    const parsed = JSON.parse(raw) as NotificationPayload & { is_cron?: boolean; targets?: string[]; message?: string };
+    // Accept 'targets' as alias for 'routing' (coordinator sessions use this format)
+    const routingArr = parsed.routing ?? parsed.targets;
     // routing: absent/empty → all transports; non-empty → only listed transports
-    if (parsed.routing && parsed.routing.length > 0 && !parsed.routing.includes("discord" as Transport)) {
+    if (routingArr && routingArr.length > 0 && !routingArr.includes("discord" as Transport)) {
       return null;
     }
     if (parsed.is_cron === true) return null;
-    if (parsed.text) text = parsed.text;
+    // Accept 'message' as alias for 'text'
+    if (parsed.text ?? parsed.message) text = (parsed.text ?? parsed.message)!;
     driver = parsed.driver;
     model = parsed.model;
     if (typeof parsed.cost === "number") cost = parsed.cost;
