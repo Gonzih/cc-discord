@@ -1,46 +1,37 @@
-# Plan: Loop Observability Layer for cc-discord
+# Plan: Fix ⏰ echo and duplicate notification bugs
 
 ## Task (restated)
-Add a "loop observability layer" so that when a meta-agent channel receives a goal-oriented
-message, the full iteration cycle (eval reports, gate checks, retries) is visible and
-controllable from Discord via a dedicated thread. Main channel stays clean; thread has the
-full trace. Human gates (🔄/✅/❌ reactions) route control signals back to the running session.
-Loop state is persisted in Redis so it survives restarts.
+Two bugs in src/notifier.ts:
 
-## Approaches
+1. **Bug 1 — ⏰ echo**: cca:chat:incoming handler echoes ALL incoming messages to Discord
+   via `bot.sendToChannelById(targetChannelId, '[from UI]: ${content}')`.
+   When a cron fires, cc-agent sends `⏰ cron fired: every 30m` to cca:chat:incoming,
+   and it leaks to Discord. The meta-agent still needs the message; only the echo must be suppressed.
 
-### A. Thin notifier shim only
-Just route loop-tagged notifications to a thread. No thread creation, no goal detection.
-Problem: no automatic thread creation means ops must manually set up threads.
+2. **Bug 2 — duplicate notifications**: A coordinator notification can arrive via TWO paths:
+   - pub/sub (PUBLISH to cca:notify:* channel) → `message` handler → deduped via `checkAndMarkSentSync` (in-memory)
+   - Redis list (LPUSH to cca:discord:notify:* list key) → `pollNotifyList` every 5s → deduped via `checkAndMarkSent` (Redis)
+   
+   These two dedup stores are SEPARATE. When pub/sub fires first (marks in-memory only),
+   the list poller runs 5s later and finds nothing in Redis → sends again.
+   Same issue in reverse: list poller marks in Redis only; pub/sub marks in-memory only.
 
-### B. Bot-owned LoopManager with full thread lifecycle ← chosen
-New `LoopManager` class in bot.ts owns loop state (in-memory + Redis). `isGoalMessage()` heuristic
-auto-detects goals. Thread is created via Discord API on the original message. Reactions on the
-thread's gate message trigger control signals. Notifier checks `getLoopThreadId(channelId)` to
-target thread vs main channel.
+## Fix Approach
 
-### C. External loop daemon via Redis events
-Separate process listens to eval report channel, manages thread state. Adds operational complexity
-without benefit for this codebase.
+### Bug 1 — simple guard before echo call (line ~571)
+Wrap the echo `sendToChannelById` in a cron-message guard:
+```javascript
+const isCronMessage = content.startsWith("⏰") || content.includes("[cron]");
+if (!isCronMessage) { bot.sendToChannelById(...) }
+```
 
-## Chosen approach: B
-
-Clean separation: `src/loop-manager.ts` owns the domain types and Redis I/O; `CcDiscordBot` owns
-the Discord interactions; `notifier.ts` queries the bot for thread routing. Additive — no changes
-to one-shot message flow.
+### Bug 2 — cross-path dedup sync
+Two-part fix:
+A. In `pollOneNamespace` (list poller): check in-memory `checkAndMarkSentSync` FIRST before Redis check.
+   In-memory check is populated by pub/sub handler, so if pub/sub fired already, list poller sees dup.
+B. In `message` handler (pub/sub): after in-memory mark, also fire-and-forget `checkAndMarkSent` (Redis).
+   This ensures list poller's Redis check sees it if Redis-primary dedup is enabled.
 
 ## Files to touch
-
-- `src/loop-manager.ts` — NEW: `LoopState`, `GateFailure`, `EvalReport`, `LoopManager`, `isGoalMessage`, `parseEvalReport`
-- `src/bot.ts` — reaction intent, `LoopManager` field, thread creation, reaction handling, `getLoopThreadId`, `postEvalEmbed`
-- `src/notifier.ts` — extend `ParsedNotification` with `evalReport`, thread routing in `flushMetaAgentBuffer`/`pollOneNamespace`/pubsub handler
-- `src/loop-manager.test.ts` — NEW: unit tests for all loop-manager exports
-- `src/notifier.test.ts` — add tests for eval_report parsing and thread routing
-
-## Risks & unknowns
-
-- `msg.startThread()` requires MANAGE_THREADS bot permission in the guild
-- Partial reaction events require fetching — handles gracefully with try/catch
-- `GatewayIntentBits.GuildMessageReactions` must be added to client intents
-- Loop state survives restart only for loops we have in memory; Redis restore on startup is deferred (MVP: in-memory only, Redis TTL 24h for audit trail)
-- Eval reports from cc-agent use a non-standard `eval_report` field in the notification JSON — cc-agent must send it; we parse defensively
+- src/notifier.ts — both fixes
+- src/notifier.test.ts — tests for both bugs; update buildMocks with lpush/ltrim/publish; import chatIncomingChannel

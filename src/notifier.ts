@@ -437,21 +437,23 @@ export function startNotifier(
       const notification = parseNotification(raw);
       if (notification === null) continue; // routing excludes discord
 
-      // Dedup: skip if this notification was already forwarded recently
-      // Uses Redis when available; falls back to in-memory dedup on Redis errors.
+      // Dedup: skip if this notification was already forwarded recently.
+      // Check in-memory first (catches pub/sub-delivered notifications in the same process).
+      if (checkAndMarkSentSync(ns, raw)) {
+        log("info", `dedup: skipping already-sent notification (ns=${ns})`);
+        continue;
+      }
+      // Also check Redis for cross-restart/cross-process dedup.
       let isDup = false;
       try {
         if (typeof (redis as unknown as Record<string, unknown>).sadd === "function") {
           isDup = await checkAndMarkSent(redis, ns, raw);
-        } else {
-          isDup = checkAndMarkSentSync(ns, raw);
         }
       } catch (err) {
-        log("warn", `dedup check failed (ns=${ns}), falling back to in-memory:`, (err as Error).message);
-        isDup = checkAndMarkSentSync(ns, raw);
+        log("warn", `dedup Redis check failed (ns=${ns}):`, (err as Error).message);
       }
       if (isDup) {
-        log("info", `dedup: skipping already-sent notification (ns=${ns})`);
+        log("info", `dedup: skipping already-sent notification (ns=${ns}) [redis]`);
         continue;
       }
 
@@ -521,6 +523,8 @@ export function startNotifier(
         log("info", `dedup: skipping already-sent pub/sub notification (ns=${ns})`);
         return;
       }
+      // Also mark in Redis so list-poller dedup sees it (prevents cross-path duplicates)
+      checkAndMarkSent(redis, ns, message).catch(() => {});
 
       let mainChannelId: string | undefined;
       if (isPrimary) {
@@ -567,10 +571,13 @@ export function startNotifier(
         : routedChannelIds.get(ns);
 
       if (targetChannelId !== undefined) {
-        // Echo to Discord so the user sees UI messages
-        bot.sendToChannelById(targetChannelId, `[from UI]: ${content}`).catch((err: Error) => {
-          log("warn", `sendToChannelById (UI echo) failed (ns=${ns}):`, err.message);
-        });
+        // Echo to Discord so the user sees UI messages (suppress cron-fire noise)
+        const isCronMessage = content.startsWith("⏰") || content.includes("[cron]");
+        if (!isCronMessage) {
+          bot.sendToChannelById(targetChannelId, `[from UI]: ${content}`).catch((err: Error) => {
+            log("warn", `sendToChannelById (UI echo) failed (ns=${ns}):`, err.message);
+          });
+        }
 
         // Log the incoming message
         const inMsg: ChatMessage = {
