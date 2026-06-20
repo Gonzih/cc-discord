@@ -21,17 +21,43 @@ import {
   chatIncomingChannel,
   createCcWire,
   TIMING,
+  dedupKey,
   type NotificationPayload,
   type Transport,
 } from "@gonzih/cc-wire";
 import { splitLongMessage, stripAnsi } from "./formatter.js";
-import { parseEvalReport, type EvalReport } from "./loop-manager.js";
-import type { CcDiscordBot } from "./bot.js";
-
-/** Redis key for per-namespace notification dedup set */
-function dedupKey(ns: string): string {
-  return `cca:discord:sent:${ns}`;
+/** Eval report from a meta-agent notification. */
+export interface EvalReport {
+  gate: string;
+  passed: boolean;
+  feedback: string;
+  iteration: number;
+  maxIterations: number;
+  confidence: number;
 }
+
+/**
+ * Parse an `eval_report` object embedded in a raw notification JSON string.
+ * Returns null when the field is absent, malformed, or the input is not JSON.
+ */
+function parseEvalReport(raw: string): EvalReport | null {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const r = parsed.eval_report as Record<string, unknown> | undefined;
+    if (!r || typeof r.gate !== "string" || typeof r.passed !== "boolean") return null;
+    return {
+      gate: r.gate,
+      passed: r.passed,
+      feedback: typeof r.feedback === "string" ? r.feedback : "",
+      iteration: typeof r.iteration === "number" ? r.iteration : 0,
+      maxIterations: typeof r.max_iterations === "number" ? r.max_iterations : 0,
+      confidence: typeof r.confidence === "number" ? r.confidence : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+import type { CcDiscordBot } from "./bot.js";
 
 /** Compute a short stable dedup fingerprint for a raw notification string */
 function notifFingerprint(raw: string): string {

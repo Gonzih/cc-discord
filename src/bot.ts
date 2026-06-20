@@ -38,9 +38,8 @@ import { transcribeVoice, isVoiceAvailable } from "./voice.js";
 import { formatForDiscord, splitLongMessage, stripAnsi } from "./formatter.js";
 import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./tokens.js";
 import { writeChatLog, type ChatMessage } from "./notifier.js";
-import { LoopManager, isGoalMessage, type EvalReport } from "./loop-manager.js";
 import { CronManager } from "./cron.js";
-import { CronEngine } from "./cron-engine.js";
+import { CronEngine, cronPendingKey, CRON_MESSAGE_TTL } from "./cron-engine.js";
 import { parseChannelCreateIntent, routeToMetaAgent } from "./router.js";
 import { createMetaAgentManager, type MetaAgentManager } from "./meta-agent-manager.js";
 
@@ -208,15 +207,12 @@ export class CcDiscordBot {
   /** ClaudeProcess running the MCP tool bridge (for callCcAgentTool) */
   private mcpSession?: ClaudeProcess;
 
-  private loopManager?: LoopManager;
-
   constructor(opts: DiscordBotOptions) {
     this.opts = opts;
     this.redis = opts.redis;
     this.namespace = opts.namespace ?? "default";
     if (opts.redis) {
       this.wire = createCcWire(opts.redis);
-      this.loopManager = new LoopManager(opts.redis);
       this.cronEngine = new CronEngine(opts.redis);
     }
     this.metaAgentManager = createMetaAgentManager();
@@ -409,6 +405,24 @@ export class CcDiscordBot {
   }
 
   /**
+   * After sending a Discord message on behalf of a cron, look up the pending cron ID
+   * for the channel's namespace and store cca:discord:cron-message:{messageId} = cronId.
+   * This lets the ❌/🛑 reaction handler disable the cron that fired this message.
+   */
+  private async storeCronMessageMapping(messageId: string, channelId: string): Promise<void> {
+    if (!this.redis) return;
+    const ns = this.resolveNamespaceForChannel(channelId);
+    try {
+      const cronId = await this.redis.get(cronPendingKey(ns));
+      if (!cronId) return;
+      await this.redis.set(`cca:discord:cron-message:${messageId}`, cronId, "EX", CRON_MESSAGE_TTL);
+      console.log(`[bot] linked message ${messageId} → cron ${cronId} (ns=${ns})`);
+    } catch (err) {
+      console.warn(`[bot] storeCronMessageMapping failed (ns=${ns}):`, (err as Error).message);
+    }
+  }
+
+  /**
    * Send text to a channel by ID, scanning for absolute file paths and attaching them.
    * Used exclusively for Claude coordinator output (meta-agent flush).
    * Falls back to plain text send if no valid files are found.
@@ -450,14 +464,17 @@ export class CcDiscordBot {
       // Send first chunk with file attachments, remaining chunks as plain text
       const files = validPaths.map((p) => ({ attachment: p, name: basename(p) }));
       try {
-        await (channel as TextChannel).send({ content: chunks[0] || undefined, files });
+        const sent = await (channel as TextChannel).send({ content: chunks[0] || undefined, files });
+        void this.storeCronMessageMapping(sent.id, channelId);
       } catch (err) {
         console.warn(`[bot] sendWithFileDetection attach failed:`, (err as Error).message);
         // Fall back to plain text for the first chunk
         if (chunks[0]?.trim()) {
-          await (channel as TextChannel).send(chunks[0]).catch((e: Error) => {
+          const sent = await (channel as TextChannel).send(chunks[0]).catch((e: Error) => {
             console.error("[bot] sendWithFileDetection fallback failed:", e.message);
+            return null;
           });
+          if (sent) void this.storeCronMessageMapping(sent.id, channelId);
         }
       }
       for (const chunk of chunks.slice(1)) {
@@ -553,47 +570,13 @@ export class CcDiscordBot {
       }
     }
 
-    // Handle messages sent inside a loop thread — route to the running meta-agent session
-    if (msg.channel.isThread() && this.redis && this.loopManager) {
-      const parentId = (msg.channel as ThreadChannel).parentId;
-      if (parentId) {
-        const loopState = this.loopManager.getState(parentId);
-        if (loopState && loopState.threadId === effectiveChannelId) {
-          const username = msg.member?.displayName ?? msg.author.username;
-          this.startMetaAgentTyping(effectiveChannelId, msg.channel as SendableChannel);
-          try {
-            await routeToMetaAgent(loopState.namespace, stampPrompt(text, username, msg.createdAt), this.redis);
-          } catch (err) {
-            await (msg.channel as ThreadChannel).send(`Failed to route: ${(err as Error).message}`).catch(() => {});
-          }
-          return;
-        }
-      }
-    }
-
     // Channel registered via createChannelForRepo or /channel — route directly to its meta-agent
     const mappedNs = this.channelNamespaceMap.get(effectiveChannelId);
     if (mappedNs && this.redis) {
-      // If a loop is already running for this channel, point the user to the thread
-      if (this.loopManager?.isActive(effectiveChannelId)) {
-        const loopState = this.loopManager.getState(effectiveChannelId)!;
-        await (msg.channel as TextChannel).send(
-          `Loop in progress → <#${loopState.threadId}>\nSend messages in the thread to interact with the running loop.`
-        ).catch(() => {});
-        return;
-      }
-
       this.writeChatMessage("user", "discord", text, effectiveChannelId, mappedNs.namespace);
       this.opts.registerRoutedChannelId?.(mappedNs.namespace, effectiveChannelId);
       this.persistChannelMapping(effectiveChannelId, mappedNs.namespace, mappedNs.repoUrl);
       this.startMetaAgentTyping(effectiveChannelId, msg.channel as SendableChannel);
-
-      // Detect goal messages → create a thread for loop tracking
-      if (this.loopManager && msg.guild && !msg.channel.isThread()) {
-        if (isGoalMessage(text)) {
-          await this.createLoopThread(msg, effectiveChannelId, mappedNs.namespace, text);
-        }
-      }
 
       const username = msg.member?.displayName ?? msg.author.username;
       try {
@@ -1453,92 +1436,29 @@ export class CcDiscordBot {
   }
 
   /** Return the thread ID for an active loop on `channelId`, or undefined. */
-  public getLoopThreadId(channelId: string): string | undefined {
-    return this.loopManager?.getThreadId(channelId);
+  public getLoopThreadId(_channelId: string): string | undefined {
+    // Loop-as-threads removed — cron engine is the loop mechanism.
+    return undefined;
+  }
+
+  /** No-op stub kept for notifier compatibility — loop threads removed. */
+  public async postEvalEmbed(_channelId: string, _report: unknown): Promise<void> {
+    return;
   }
 
   /**
-   * Post a structured eval-report embed to the loop thread for `channelId`.
-   * Also records gate failures in the LoopManager if the gate did not pass.
+   * Handle ❌/🛑 reactions on cron-fired messages to disable the cron.
+   * Also no-ops the old loop gate reactions (🔄/✅) gracefully.
    */
-  public async postEvalEmbed(channelId: string, report: EvalReport): Promise<void> {
-    const threadId = this.loopManager?.getThreadId(channelId);
-    if (!threadId) return;
-    const channel = await this.getChannel(threadId);
-    if (!channel) return;
-
-    const color = report.passed ? 0x57F287 : 0xED4245; // green / red
-    const embed = new EmbedBuilder()
-      .setTitle(`${report.passed ? "✅" : "❌"} Gate: ${report.gate}`)
-      .setColor(color)
-      .addFields(
-        { name: "Result", value: report.passed ? "PASSED" : "FAILED", inline: true },
-        { name: "Confidence", value: `${(report.confidence * 100).toFixed(0)}%`, inline: true },
-        { name: "Iteration", value: `${report.iteration} / ${report.maxIterations}`, inline: true },
-        { name: "Feedback", value: report.feedback || "(none)", inline: false },
-      )
-      .setTimestamp();
-
-    await (channel as TextChannel).send({ embeds: [embed] }).catch((err: Error) => {
-      console.warn(`[bot] postEvalEmbed send failed:`, err.message);
-    });
-
-    if (!report.passed && this.loopManager) {
-      await this.loopManager.addGateFailure(channelId, {
-        gate: report.gate,
-        feedback: report.feedback,
-        iteration: report.iteration,
-        confidence: report.confidence,
-        timestamp: new Date().toISOString(),
-      });
-    }
-  }
-
-  /**
-   * Create a Discord thread on `msg`, register loop state, and add reaction gates.
-   * Requires MANAGE_THREADS permission. Falls back silently on failure.
-   */
-  private async createLoopThread(
-    msg: Message,
-    channelId: string,
-    namespace: string,
-    goal: string
-  ): Promise<void> {
-    try {
-      const shortGoal = goal.slice(0, 48).replace(/\s+/g, " ");
-      const threadName = `Goal: ${shortGoal}${goal.length > 48 ? "…" : ""}`;
-      const thread = await (msg.channel as TextChannel).threads.create({
-        name: threadName,
-        autoArchiveDuration: 10080, // 1 week
-        startMessage: msg,
-        reason: "Loop observability thread",
-      });
-
-      const firstMsg = await thread.send(
-        `🎯 **Loop tracking thread**\n> ${goal.slice(0, 200)}\n\nReact to control the loop:\n` +
-        `🔄 Retry current iteration  ✅ Accept & exit  ❌ Kill loop`
-      );
-      await firstMsg.react("🔄");
-      await firstMsg.react("✅");
-      await firstMsg.react("❌");
-
-      await this.loopManager!.startLoop(channelId, thread.id, firstMsg.id, namespace, goal);
-      console.log(`[bot] loop thread created: channelId=${channelId} threadId=${thread.id}`);
-    } catch (err) {
-      console.warn(`[bot] createLoopThread failed:`, (err as Error).message);
-    }
-  }
-
-  /** Handle 🔄/✅/❌ reactions on loop gate messages. */
   private async handleReactionAdd(
     reaction: MessageReaction | PartialMessageReaction,
     user: User | PartialUser
   ): Promise<void> {
     if (user.bot) return;
     if (!this.isAllowed(user.id)) return;
-    if (!this.loopManager || !this.redis) return;
+    if (!this.redis || !this.cronEngine) return;
 
-    // Fetch full reaction object if partial (bot doesn't have it cached)
+    // Fetch full reaction object if partial
     let fullReaction = reaction;
     if (reaction.partial) {
       try {
@@ -1549,50 +1469,19 @@ export class CcDiscordBot {
     }
 
     const emoji = fullReaction.emoji.name;
-    if (emoji !== "🔄" && emoji !== "✅" && emoji !== "❌") return;
+    if (emoji !== "❌" && emoji !== "🛑") return;
 
     const messageId = fullReaction.message.id;
-    const channelId = this.loopManager.getChannelIdByReactionMessage(messageId);
-    if (!channelId) return;
+    // Look up which cron fired this message
+    const cronId = await this.redis.get(`cca:discord:cron-message:${messageId}`).catch(() => null);
+    if (!cronId) return;
 
-    const loopState = this.loopManager.getState(channelId);
-    if (!loopState) return;
-
-    const thread = await this.getChannel(loopState.threadId);
-
-    if (emoji === "🔄") {
-      if (thread) {
-        await (thread as ThreadChannel).send(
-          `🔄 Retry requested — re-running iteration ${loopState.iteration + 1}`
-        ).catch(() => {});
-      }
-      try {
-        await routeToMetaAgent(
-          loopState.namespace,
-          `Please retry the previous goal: ${loopState.goal}`,
-          this.redis
-        );
-      } catch (err) {
-        console.warn(`[bot] retry routeToMetaAgent failed:`, (err as Error).message);
-      }
-    } else if (emoji === "✅") {
-      if (thread) {
-        await (thread as ThreadChannel).send("✅ Loop accepted — marking complete").catch(() => {});
-      }
-      await this.sendToChannelById(channelId, `✅ Goal completed: ${loopState.goal.slice(0, 100)}`);
-      await this.loopManager.endLoop(channelId);
-      if (thread && thread.isThread()) {
-        await thread.setArchived(true).catch(() => {});
-      }
-    } else if (emoji === "❌") {
-      if (thread) {
-        await (thread as ThreadChannel).send("❌ Loop killed by user").catch(() => {});
-      }
-      await this.sendToChannelById(channelId, `❌ Loop killed: ${loopState.goal.slice(0, 100)}`);
-      await this.loopManager.endLoop(channelId);
-      if (thread && thread.isThread()) {
-        await thread.setArchived(true).catch(() => {});
-      }
+    // Disable the cron by setting enabled="false" in its hash
+    try {
+      await this.redis.hset(`cca:discord:cron:${cronId}`, "enabled", "0");
+      console.log(`[bot] cron ${cronId} disabled via ${emoji} reaction on message ${messageId}`);
+    } catch (err) {
+      console.warn(`[bot] failed to disable cron ${cronId}:`, (err as Error).message);
     }
   }
 

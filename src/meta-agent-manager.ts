@@ -15,7 +15,10 @@ import { homedir } from "os";
 import {
   CC_DISCORD_WORKSPACE_ROOT,
   TIMING,
+  DISCORD_INSTANCE_KEY,
   discordMetaInputKey,
+  metaStreamChannel as ccWireMetaStreamChannel,
+  metaLogKey as ccWireMetaLogKey,
 } from "@gonzih/cc-wire";
 import type { createCcWire } from "@gonzih/cc-wire";
 
@@ -135,13 +138,10 @@ function resolveClaude(): string {
  * Redis keys for meta-agent stdout streaming.
  * cca:meta:{ns}:stream — pub/sub channel (live streaming)
  * cca:meta:{ns}:log    — list (history, capped at 2000)
+ * Re-exported from cc-wire for backwards-compat with callers in this package.
  */
-export function metaStreamChannel(ns: string): string {
-  return `cca:meta:${ns}:stream`;
-}
-export function metaLogKey(ns: string): string {
-  return `cca:meta:${ns}:log`;
-}
+export const metaStreamChannel = ccWireMetaStreamChannel;
+export const metaLogKey = ccWireMetaLogKey;
 
 /**
  * Spawn `claude --continue -p "{message}" --dangerously-skip-permissions` in the
@@ -168,7 +168,7 @@ export function spawnSession(ns: string, message: string, token: string, wire: W
       [
         "--continue",
         "-p", message,
-        "--output-format", "text",
+        "--output-format", "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
       ],
@@ -177,49 +177,107 @@ export function spawnSession(ns: string, message: string, token: string, wire: W
 
     let lineBuffer = "";
 
-    const publishLine = (line: string): void => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
-      const msg = {
-        id: crypto.randomUUID(),
-        source: "claude" as const,
-        role: "assistant" as const,
-        content: trimmed,
-        timestamp: new Date().toISOString(),
-        chatId: 0,
-      };
-      wire.discord.publishOutgoing(ns, msg).catch((err: Error) => {
-        console.warn(`[meta-agent-manager] publishOutgoing failed (ns=${ns}):`, err.message);
-      });
-    };
-
+    /**
+     * Parse a JSONL line from claude's stream-json stdout into a structured event.
+     * For lines that fail JSON.parse, emit { type: "text", text: line }.
+     * Forward each event as a JSON string to Redis:
+     *   PUBLISH cca:meta:{ns}:stream
+     *   LPUSH   cca:meta:{ns}:log  (capped at 2000)
+     */
     const rawRedis = wire._redis;
-    const streamToRedis = (chunk: string): void => {
-      const entry = JSON.stringify({ ts: Date.now(), ns, text: chunk });
-      const streamCh = metaStreamChannel(ns);
-      const logKey = metaLogKey(ns);
-      // Publish for live consumers (fire-and-forget)
-      rawRedis.publish(streamCh, entry).catch((err: Error) => {
+    const streamCh = metaStreamChannel(ns);
+    const logKey = metaLogKey(ns);
+
+    const forwardEventToRedis = (eventJson: string): void => {
+      rawRedis.publish(streamCh, eventJson).catch((err: Error) => {
         console.warn(`[meta-agent-manager] stream publish failed (ns=${ns}):`, err.message);
       });
-      // Persist to log list, cap at 2000
-      rawRedis.lpush(logKey, entry).then(() => {
+      rawRedis.lpush(logKey, eventJson).then(() => {
         rawRedis.ltrim(logKey, 0, 1999).catch(() => {});
       }).catch((err: Error) => {
         console.warn(`[meta-agent-manager] log lpush failed (ns=${ns}):`, err.message);
       });
     };
 
-    proc.stdout.on("data", (chunk: Buffer) => {
-      const chunkStr = chunk.toString();
-      // Stream raw chunk to Redis (before line-splitting)
-      streamToRedis(chunkStr);
+    const processLine = (line: string): void => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
 
-      lineBuffer += chunkStr;
+      let structuredEvent: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+        // Map claude stream-json event shapes to our canonical structured event format
+        const type = parsed.type as string | undefined;
+        if (type === "assistant") {
+          // Extract text from content blocks
+          const content = parsed.message as { content?: Array<{ type: string; text?: string }> } | undefined;
+          const textBlock = content?.content?.find((b) => b.type === "text");
+          const text = textBlock?.text ?? "";
+          structuredEvent = { type: "assistant", text };
+          // Also publish to Discord outgoing channel
+          if (text) {
+            const msg = {
+              id: crypto.randomUUID(),
+              source: "claude" as const,
+              role: "assistant" as const,
+              content: text,
+              timestamp: new Date().toISOString(),
+              chatId: 0,
+            };
+            wire.discord.publishOutgoing(ns, msg).catch((err: Error) => {
+              console.warn(`[meta-agent-manager] publishOutgoing failed (ns=${ns}):`, err.message);
+            });
+          }
+        } else if (type === "tool_use") {
+          structuredEvent = {
+            type: "tool_use",
+            name: parsed.name ?? "",
+            input: parsed.input ?? {},
+          };
+        } else if (type === "tool_result") {
+          structuredEvent = {
+            type: "tool_result",
+            content: parsed.content ?? "",
+          };
+        } else if (type === "result") {
+          const resultText = typeof parsed.result === "string" ? parsed.result : JSON.stringify(parsed.result ?? "");
+          structuredEvent = {
+            type: "result",
+            result: resultText,
+            is_error: parsed.is_error ?? false,
+          };
+          // Publish result text to Discord as final assistant message
+          if (resultText) {
+            const msg = {
+              id: crypto.randomUUID(),
+              source: "claude" as const,
+              role: "assistant" as const,
+              content: resultText,
+              timestamp: new Date().toISOString(),
+              chatId: 0,
+            };
+            wire.discord.publishOutgoing(ns, msg).catch((err: Error) => {
+              console.warn(`[meta-agent-manager] publishOutgoing (result) failed (ns=${ns}):`, err.message);
+            });
+          }
+        } else {
+          // Forward other event types as-is
+          structuredEvent = parsed;
+        }
+      } catch {
+        // Non-JSON line — wrap as text event
+        structuredEvent = { type: "text", text: trimmed };
+      }
+
+      forwardEventToRedis(JSON.stringify(structuredEvent));
+    };
+
+    proc.stdout.on("data", (chunk: Buffer) => {
+      lineBuffer += chunk.toString();
       const lines = lineBuffer.split("\n");
       lineBuffer = lines.pop() ?? "";
       for (const line of lines) {
-        publishLine(line);
+        processLine(line);
       }
     });
 
@@ -230,7 +288,7 @@ export function spawnSession(ns: string, message: string, token: string, wire: W
 
     proc.on("exit", (code) => {
       // Flush any remaining buffered content
-      if (lineBuffer.trim()) publishLine(lineBuffer);
+      if (lineBuffer.trim()) processLine(lineBuffer);
       lineBuffer = "";
       console.log(`[meta-agent-manager] session exited (ns=${ns}, code=${code})`);
       resolve();
@@ -274,8 +332,6 @@ export function createMetaAgentManager(): MetaAgentManager {
     startPolling(wire, getNamespaces, instanceId) {
       if (pollInterval) return; // already running
 
-      const INSTANCE_KEY = "cca:discord:instance";
-
       pollInterval = setInterval(() => {
         const namespaces = getNamespaces();
         if (namespaces.length === 0) return;
@@ -290,7 +346,7 @@ export function createMetaAgentManager(): MetaAgentManager {
               // Staleness check: if a newer instance has registered, this process is stale — exit.
               if (instanceId) {
                 try {
-                  const current = await wire._redis.get(INSTANCE_KEY);
+                  const current = await wire._redis.get(DISCORD_INSTANCE_KEY);
                   if (current && current !== instanceId) {
                     console.log(`[meta-agent-manager] stale instance detected (current=${current}, ours=${instanceId}) — exiting`);
                     process.exit(0);
