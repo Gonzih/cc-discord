@@ -1190,6 +1190,8 @@ export class CcDiscordBot {
 
       case "clear": {
         const ns = this.resolveNamespaceForChannel(channelId);
+        // Kill the persistent session first so Claude releases the JSONL file
+        this.metaAgentManager.killSession(ns);
         const deleted = this.clearClaudeSession(ns);
         await interaction.reply(
           deleted > 0
@@ -1202,9 +1204,8 @@ export class CcDiscordBot {
       case "compact": {
         const ns = this.resolveNamespaceForChannel(channelId);
         await interaction.reply(`Compacting context for ${ns}...`);
-        this.compactClaudeSession(ns).catch((err: Error) => {
-          console.warn(`[bot] /compact failed (ns=${ns}):`, err.message);
-        });
+        // Send /compact via stdin to the running persistent session
+        this.metaAgentManager.sendToSession(ns, "/compact");
         break;
       }
 
