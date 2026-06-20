@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { parseNotification, resolveNotifyChannel, startNotifier } from "./notifier.js";
-import { discordNotify, discordChatOutgoing, notifyChannel } from "@gonzih/cc-wire";
+import { discordNotify, discordChatOutgoing, notifyChannel, chatIncomingChannel } from "@gonzih/cc-wire";
 
 describe("resolveNotifyChannel", () => {
   it("returns reverseSnowflakeLookup result when chatId and lookup available", () => {
@@ -212,6 +212,13 @@ function buildMocks(loopThreadMap?: Map<string, string>) {
     // wire.token.getMaster fallback
     hgetall: vi.fn().mockResolvedValue(null),
     smembers: vi.fn().mockResolvedValue([]),
+    // writeChatLog direct calls
+    lpush: vi.fn().mockResolvedValue(1),
+    ltrim: vi.fn().mockResolvedValue("OK"),
+    publish: vi.fn().mockResolvedValue(0),
+    // checkAndMarkSent (Redis dedup) — return 1 (new) by default
+    sadd: vi.fn().mockResolvedValue(1),
+    expire: vi.fn().mockResolvedValue(1),
   };
 
   return { mockBot, mockSub, mockRedis, sent, stoppedTyping, evalEmbeds, listQueues };
@@ -603,5 +610,104 @@ describe("startNotifier — loop thread routing", () => {
     await vi.advanceTimersByTimeAsync(2_000);
 
     expect(sent).toHaveLength(0);
+  });
+});
+
+describe("startNotifier — chat:incoming echo suppression (Bug 1)", () => {
+  it("does NOT echo ⏰ cron-fire messages to Discord", () => {
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    mockSub.emit("message", chatIncomingChannel("money-brain"), "⏰ cron fired: every 30m");
+
+    expect(sent.filter((m) => m.text.includes("⏰"))).toHaveLength(0);
+  });
+
+  it("does NOT echo messages containing [cron] to Discord", () => {
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    mockSub.emit("message", chatIncomingChannel("money-brain"), "[cron] heartbeat check");
+
+    expect(sent.filter((m) => m.text.includes("[cron]"))).toHaveLength(0);
+  });
+
+  it("echoes normal (non-cron) messages to Discord", () => {
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    mockSub.emit("message", chatIncomingChannel("money-brain"), "hello from UI");
+
+    expect(sent).toContainEqual({ channelId: "primary-notify-ch", text: "[from UI]: hello from UI" });
+  });
+
+  it("echoes JSON-wrapped normal message to Discord", () => {
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    const payload = JSON.stringify({ content: "deploy the service" });
+    mockSub.emit("message", chatIncomingChannel("money-brain"), payload);
+
+    expect(sent).toContainEqual({ channelId: "primary-notify-ch", text: "[from UI]: deploy the service" });
+  });
+});
+
+describe("startNotifier — cross-path dedup (Bug 2)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does not deliver same notification twice when pub/sub fires before list poll", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockSub, mockRedis, sent, listQueues } = buildMocks();
+
+    // Unique namespace to avoid in-memory dedup cache pollution from other tests
+    const ns = "dedup-cross-path-test";
+    const raw = JSON.stringify({ text: "coordinator notification" });
+
+    // Same raw notification available in BOTH the list queue AND pub/sub channel
+    listQueues.set(discordNotify(ns), [raw]);
+
+    const handle = startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      ns,
+      mockRedis as never,
+    );
+    // Register a channel so poll has a target
+    handle.registerRoutedChannelId(ns, "primary-notify-ch");
+
+    // Pub/sub fires first (marks in-memory)
+    mockSub.emit("message", discordNotify(ns), raw);
+
+    // List poller fires 5s later — should see in-memory dup and skip
+    await vi.advanceTimersByTimeAsync(5_100);
+
+    const deliveries = sent.filter((m) => m.text === "coordinator notification");
+    expect(deliveries).toHaveLength(1);
   });
 });

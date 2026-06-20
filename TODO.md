@@ -1,11 +1,13 @@
-# TODO: loop observability layer
+# TODO: fix ⏰ echo and duplicate notification bugs
 
-- [x] git checkout -b feat/loop-observability
-- [ ] src/loop-manager.ts — create LoopState, GateFailure, EvalReport, LoopManager, isGoalMessage, parseEvalReport
-- [ ] src/bot.ts — add GuildMessageReactions intent, LoopManager field, handleReactionAdd, createLoopThread, getLoopThreadId, postEvalEmbed, modify handleMessage for loop detection + thread routing
-- [ ] src/notifier.ts — extend ParsedNotification with evalReport, update parseNotification, thread routing in flushMetaAgentBuffer / pollOneNamespace / pubsub handler
-- [ ] src/loop-manager.test.ts — unit tests for isGoalMessage, parseEvalReport, LoopManager
-- [ ] src/notifier.test.ts — tests for eval_report parsing and thread routing
+- [ ] git checkout -b fix/cron-echo-dedup
+- [ ] src/notifier.ts — Bug 1: suppress cron echo in chat:incoming handler
+- [ ] src/notifier.ts — Bug 2A: in pollOneNamespace, check in-memory dedup first
+- [ ] src/notifier.ts — Bug 2B: in message handler, fire-and-forget Redis mark after in-memory mark
+- [ ] src/notifier.test.ts — add chatIncomingChannel import
+- [ ] src/notifier.test.ts — update buildMocks with lpush, ltrim, publish methods
+- [ ] src/notifier.test.ts — add tests for Bug 1 (⏰ and [cron] suppression, normal pass-through)
+- [ ] src/notifier.test.ts — add test for Bug 2 (cross-path dedup: pub/sub then list poll)
 - [ ] npm test — all pass
 - [ ] git diff --staged — verify
 - [ ] git commit + push
