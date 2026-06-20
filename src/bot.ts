@@ -40,6 +40,7 @@ import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./to
 import { writeChatLog, type ChatMessage } from "./notifier.js";
 import { CronManager } from "./cron.js";
 import { CronEngine, cronPendingKey, CRON_MESSAGE_TTL } from "./cron-engine.js";
+import { LoopEngine, loopPendingKey, LOOP_MESSAGE_TTL, parseIntervalMs } from "./loop-engine.js";
 import { parseChannelCreateIntent, routeToMetaAgent } from "./router.js";
 import { createMetaAgentManager, type MetaAgentManager } from "./meta-agent-manager.js";
 
@@ -203,6 +204,7 @@ export class CcDiscordBot {
   private lastActiveChannelId?: string;
   private cron: CronManager;
   private cronEngine?: CronEngine;
+  private loopEngine?: LoopEngine;
   private metaAgentManager: MetaAgentManager;
   /** ClaudeProcess running the MCP tool bridge (for callCcAgentTool) */
   private mcpSession?: ClaudeProcess;
@@ -214,6 +216,7 @@ export class CcDiscordBot {
     if (opts.redis) {
       this.wire = createCcWire(opts.redis);
       this.cronEngine = new CronEngine(opts.redis);
+      this.loopEngine = new LoopEngine(opts.redis);
     }
     this.metaAgentManager = createMetaAgentManager();
 
@@ -1011,6 +1014,44 @@ export class CcDiscordBot {
             .setDescription("Delete a cron job permanently")
             .addStringOption((opt) => opt.setName("id").setDescription("Cron ID").setRequired(true))
         ),
+      new SlashCommandBuilder()
+        .setName("loop")
+        .setDescription("Manage Redis-persisted interval loops for this channel's namespace")
+        .addSubcommand((sub) =>
+          sub
+            .setName("add")
+            .setDescription("Add a loop (fires immediately, then repeats at fixed interval)")
+            .addStringOption((opt) =>
+              opt.setName("interval").setDescription("Interval e.g. '30m', '1h', '20m', '30s'").setRequired(true)
+            )
+            .addStringOption((opt) =>
+              opt.setName("message").setDescription("Message to push to the meta-agent input queue").setRequired(true)
+            )
+            .addIntegerOption((opt) =>
+              opt.setName("compact_every").setDescription("Push /compact every N fires (default: 10, 0 = never)").setRequired(false)
+            )
+        )
+        .addSubcommand((sub) =>
+          sub.setName("list").setDescription("List all loops for this namespace")
+        )
+        .addSubcommand((sub) =>
+          sub
+            .setName("pause")
+            .setDescription("Pause a loop")
+            .addStringOption((opt) => opt.setName("id").setDescription("Loop ID").setRequired(true))
+        )
+        .addSubcommand((sub) =>
+          sub
+            .setName("resume")
+            .setDescription("Resume a paused loop (fires immediately)")
+            .addStringOption((opt) => opt.setName("id").setDescription("Loop ID").setRequired(true))
+        )
+        .addSubcommand((sub) =>
+          sub
+            .setName("delete")
+            .setDescription("Delete a loop permanently")
+            .addStringOption((opt) => opt.setName("id").setDescription("Loop ID").setRequired(true))
+        ),
     ].map((cmd) => cmd.toJSON());
 
     const rest = new REST().setToken(this.opts.discordToken);
@@ -1171,6 +1212,11 @@ export class CcDiscordBot {
         await this.handleCronEngineCommand(interaction, channelId);
         break;
       }
+
+      case "loop": {
+        await this.handleLoopEngineCommand(interaction, channelId);
+        break;
+      }
     }
   }
 
@@ -1302,6 +1348,97 @@ export class CcDiscordBot {
 
       default:
         await interaction.reply("Unknown /cron subcommand.");
+    }
+  }
+
+  /**
+   * Handle the /loop command group — backed by LoopEngine (Redis-persisted, interval-based).
+   * Loops fire immediately on creation and on startup, then repeat every intervalMs ms.
+   * Namespace is derived from the channel's registered namespace.
+   */
+  private async handleLoopEngineCommand(interaction: ChatInputCommandInteraction, channelId: string): Promise<void> {
+    if (!this.loopEngine) {
+      await interaction.reply({ content: "Loop engine unavailable (no Redis connection).", ephemeral: true });
+      return;
+    }
+
+    const ns = this.resolveNamespaceForChannel(channelId);
+    const sub = interaction.options.getSubcommand();
+
+    switch (sub) {
+      case "add": {
+        const intervalStr = interaction.options.getString("interval", true);
+        const message = interaction.options.getString("message", true);
+        const compactEvery = interaction.options.getInteger("compact_every") ?? 10;
+
+        const intervalMs = parseIntervalMs(intervalStr);
+        if (intervalMs === null || intervalMs <= 0) {
+          await interaction.reply(
+            `Invalid interval: \`${intervalStr}\`\nUse format: \`30s\`, \`5m\`, \`20m\`, \`1h\`, \`2h\`, \`1d\``
+          );
+          return;
+        }
+
+        await interaction.deferReply();
+        const rec = await this.loopEngine.add(ns, intervalMs, message, compactEvery);
+        const humanInterval = intervalStr;
+        await interaction.editReply(
+          `Loop added for namespace **${ns}**\nID: \`${rec.id}\`\nInterval: \`${humanInterval}\` (${intervalMs}ms)\nCompact every: ${rec.compactEvery} fires\n(Fired immediately on creation.)`
+        );
+        break;
+      }
+
+      case "list": {
+        await interaction.deferReply();
+        const allLoops = await this.loopEngine.list();
+        const nsLoops = allLoops.filter((r) => r.namespace === ns);
+        if (nsLoops.length === 0) {
+          await interaction.editReply(`No loops for namespace **${ns}**.`);
+        } else {
+          const embed = new EmbedBuilder()
+            .setTitle(`Loops — ${ns}`)
+            .setColor(0x57F287)
+            .setDescription(
+              nsLoops
+                .map((r) => {
+                  const statusEmoji = r.status === "active" ? "🟢" : "⏸️";
+                  const last = r.lastRun ? `last run ${r.lastRun}` : "never run";
+                  const intervalSec = Math.round(r.intervalMs / 1000);
+                  return `${statusEmoji} **\`${r.id}\`** [${r.status}]\nInterval: ${intervalSec}s | Fires: ${r.fireCount} | ${last}\nMessage: \`${r.message.slice(0, 80)}${r.message.length > 80 ? "…" : ""}\``;
+                })
+                .join("\n\n")
+            );
+          await interaction.editReply({ embeds: [embed] });
+        }
+        break;
+      }
+
+      case "pause": {
+        const id = interaction.options.getString("id", true);
+        await interaction.deferReply();
+        const ok = await this.loopEngine.pause(id);
+        await interaction.editReply(ok ? `Loop \`${id}\` paused.` : `Loop \`${id}\` not found.`);
+        break;
+      }
+
+      case "resume": {
+        const id = interaction.options.getString("id", true);
+        await interaction.deferReply();
+        const ok = await this.loopEngine.resume(id);
+        await interaction.editReply(ok ? `Loop \`${id}\` resumed (fired immediately).` : `Loop \`${id}\` not found.`);
+        break;
+      }
+
+      case "delete": {
+        const id = interaction.options.getString("id", true);
+        await interaction.deferReply();
+        const ok = await this.loopEngine.delete(id);
+        await interaction.editReply(ok ? `Loop \`${id}\` deleted.` : `Loop \`${id}\` not found.`);
+        break;
+      }
+
+      default:
+        await interaction.reply("Unknown /loop subcommand.");
     }
   }
 
@@ -1567,6 +1704,18 @@ export class CcDiscordBot {
   }
 
   /**
+   * Start the LoopEngine — loads all active loops from Redis, fires each immediately,
+   * then starts their repeat timers.
+   * Called from index.ts after startup migrations complete (alongside startCronEngine).
+   */
+  public startLoopEngine(): void {
+    if (!this.loopEngine) return;
+    this.loopEngine.start().catch((err: Error) => {
+      console.warn("[bot] loopEngine.start() failed:", err.message);
+    });
+  }
+
+  /**
    * Resolve the namespace for a given channelId.
    * Routed channels use their registered namespace; everything else uses the bot's primary namespace.
    */
@@ -1665,6 +1814,7 @@ export class CcDiscordBot {
       this.stopMetaAgentTyping(channelId);
     }
     this.metaAgentManager.stop();
+    this.loopEngine?.stop();
     void this.client.destroy();
   }
 }

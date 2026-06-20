@@ -166,6 +166,9 @@ async function runStartupMigrations(): Promise<void> {
 
   // 4. Start cron engine — loads and schedules all Redis-persisted crons
   bot.startCronEngine();
+
+  // 5. Start loop engine — loads all active loops, fires each immediately, then starts timers
+  bot.startLoopEngine();
 }
 
 // Mutable placeholder closures — filled in once `bot` is created below
