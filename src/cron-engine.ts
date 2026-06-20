@@ -21,12 +21,29 @@ import { randomUUID } from "crypto";
 import { schedule, validate } from "node-cron";
 import type { ScheduledTask } from "node-cron";
 import type { Redis } from "ioredis";
+import {
+  cronListKey,
+  cronHashKey,
+  discordMetaInputKey as metaInputKey,
+} from "@gonzih/cc-wire";
 
 // ─── Redis key helpers ────────────────────────────────────────────────────────
 
-const CRON_LIST_KEY = "cca:discord:cron:list";
-const cronHashKey = (id: string): string => `cca:discord:cron:${id}`;
-const metaInputKey = (ns: string): string => `cca:discord:meta:${ns}:input`;
+const CRON_LIST_KEY = cronListKey();
+
+/**
+ * Temporary key written by the cron engine when it fires a cron.
+ * Value is the cronId that fired. TTL 300s.
+ * The bot reads this after sending a Discord message to link the message to the cron.
+ */
+export const cronPendingKey = (ns: string): string => `cca:discord:cron-pending:${ns}`;
+
+/**
+ * Key that maps a sent Discord messageId → cronId.
+ * Used by the reaction handler to look up which cron to disable.
+ * TTL 86400s (24h).
+ */
+export const CRON_MESSAGE_TTL = 86400;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -269,6 +286,9 @@ export class CronEngine {
       await this.redis.rpush(inputKey, entry);
       rec.last_fired_at = new Date().toISOString();
       console.log(`[cron-engine] fire: pushed message (id=${id} ns=${ns} fire_count=${rec.fire_count})`);
+      // Record which cron fired for this namespace — the bot reads this after
+      // sending the Discord message to store the cca:discord:cron-message:{msgId} mapping.
+      await this.redis.set(cronPendingKey(ns), id, "EX", 300);
     } catch (err) {
       console.warn(`[cron-engine] fire: push failed (id=${id}):`, (err as Error).message);
     }
