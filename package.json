@@ -1,6 +1,6 @@
 {
   "name": "@gonzih/cc-discord",
-  "version": "0.2.22",
+  "version": "0.2.23",
   "description": "Claude Code Discord bot — chat with Claude Code via Discord",
   "type": "module",
   "bin": {
@@ -19,7 +19,7 @@
     "dist/"
   ],
   "dependencies": {
-    "@gonzih/cc-wire": "^0.3.0",
+    "@gonzih/cc-wire": "^0.4.0",
     "@types/node-cron": "^3.0.11",
     "discord.js": "^14.0.0",
     "ioredis": "^5.0.0",
