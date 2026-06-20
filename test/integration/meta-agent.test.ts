@@ -2,11 +2,22 @@
  * Integration tests for cc-discord meta-agent and cron engine.
  *
  * Requirements:
- *   - Redis running at REDIS_URL (defaults to redis://localhost:6379)
+ *   - Redis running at REDIS_URL (defaults to redis://localhost:6379/1)
  *   - CLAUDE_BIN is wired to test/fixtures/mock-claude.js via test:integration script
  *
  * All keys are namespaced to cc-discord-test-* and cleaned up after each test.
+ *
+ * DB ISOLATION: Tests run against Redis DB 1 (not DB 0) to avoid touching
+ * production data. REDIS_URL is forced to DB 1 here before any Redis client
+ * is created.
  */
+
+// Force Redis DB 1 for all integration tests — must run before any import
+// that could read process.env.REDIS_URL and before the Redis client is created.
+if (!process.env.REDIS_URL || !process.env.REDIS_URL.includes("/1")) {
+  const base = (process.env.REDIS_URL ?? "redis://localhost:6379").replace(/\/\d+$/, "");
+  process.env.REDIS_URL = `${base}/1`;
+}
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
 import { resolve, dirname } from "path";
@@ -28,7 +39,8 @@ const MOCK_CLAUDE_BIN = resolve(__dirname, "../fixtures/mock-claude.js");
 
 // ─── Redis setup ──────────────────────────────────────────────────────────────
 
-const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6379";
+// REDIS_URL is guaranteed to point at DB 1 (set above before imports).
+const REDIS_URL = process.env.REDIS_URL!;
 
 let redis: Redis;
 let redisAvailable = false;
@@ -51,8 +63,24 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  if (redisAvailable && testKeys.length > 0) {
-    await redis.del(...testKeys);
+  if (redisAvailable) {
+    // Flush all tracked keys
+    if (testKeys.length > 0) {
+      await redis.del(...testKeys);
+    }
+    // Broad pattern cleanup: delete any cc-discord-test* keys that leaked
+    // (covers meta, sent, cron, and any other patterns used by these tests)
+    const patterns = [
+      "cca:discord:meta:cc-discord-test*",
+      "cca:discord:sent:cc-discord-test*",
+      "cca:discord:cron:*",
+    ];
+    for (const pattern of patterns) {
+      const keys = await redis.keys(pattern);
+      if (keys.length > 0) {
+        await redis.del(...keys);
+      }
+    }
   }
   redis.disconnect();
 });
