@@ -4,11 +4,16 @@
  * Flow per namespace:
  *   1. ensureWorkspace: git clone repo to ~/cc-discord-workspace/{ns}
  *   2. injectMcp: write .mcp.json so the claude subprocess has MCP tool access
- *   3. pollQueues (3s interval): wire.discord.dequeue(ns) → spawnSession(ns, content)
- *   4. spawnSession: claude --continue -p "{message}" pipes stdout → wire.discord.publishOutgoing
+ *   3. ensureSession: spawn one persistent `claude --continue` process per namespace
+ *      (no -p flag — messages go via stdin)
+ *   4. On new message: write "${message}\n" to stdin of the running process
+ *   5. On process exit: remove from sessions map; next message respawns
+ *
+ * The polling loop now just drains any queued Redis messages into stdin.
+ * No more per-message process spawn — Claude receives messages in sequence.
  */
 
-import { spawn, execSync } from "child_process";
+import { spawn, execSync, type ChildProcess } from "child_process";
 import { existsSync, mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -144,24 +149,150 @@ export const metaStreamChannel = ccWireMetaStreamChannel;
 export const metaLogKey = ccWireMetaLogKey;
 
 /**
+ * Build the env object for a claude subprocess based on the token type.
+ */
+function buildEnv(token: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (token.startsWith("sk-ant-api")) {
+    env.ANTHROPIC_API_KEY = token;
+    delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  } else {
+    env.CLAUDE_CODE_OAUTH_TOKEN = token;
+    delete env.ANTHROPIC_API_KEY;
+  }
+  return env;
+}
+
+/**
+ * Wire stdout from a claude subprocess into Redis.
+ * Parses JSONL lines from stream-json format, publishes to:
+ *   PUBLISH cca:meta:{ns}:stream
+ *   LPUSH   cca:meta:{ns}:log  (capped at 2000)
+ * Also dispatches assistant/result text to wire.discord.publishOutgoing.
+ */
+function wireStdoutToRedis(
+  proc: ChildProcess,
+  ns: string,
+  wire: Wire,
+): void {
+  const rawRedis = wire._redis;
+  const streamCh = metaStreamChannel(ns);
+  const logKey = metaLogKey(ns);
+
+  const forwardEventToRedis = (eventJson: string): void => {
+    rawRedis.publish(streamCh, eventJson).catch((err: Error) => {
+      console.warn(`[meta-agent-manager] stream publish failed (ns=${ns}):`, err.message);
+    });
+    rawRedis.lpush(logKey, eventJson).then(() => {
+      rawRedis.ltrim(logKey, 0, 1999).catch(() => {});
+    }).catch((err: Error) => {
+      console.warn(`[meta-agent-manager] log lpush failed (ns=${ns}):`, err.message);
+    });
+  };
+
+  const processLine = (line: string): void => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+
+    let structuredEvent: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      const type = parsed.type as string | undefined;
+      if (type === "assistant") {
+        const content = parsed.message as { content?: Array<{ type: string; text?: string }> } | undefined;
+        const textBlock = content?.content?.find((b) => b.type === "text");
+        const text = textBlock?.text ?? "";
+        structuredEvent = { type: "assistant", text };
+        if (text) {
+          const msg = {
+            id: crypto.randomUUID(),
+            source: "claude" as const,
+            role: "assistant" as const,
+            content: text,
+            timestamp: new Date().toISOString(),
+            chatId: 0,
+          };
+          wire.discord.publishOutgoing(ns, msg).catch((err: Error) => {
+            console.warn(`[meta-agent-manager] publishOutgoing failed (ns=${ns}):`, err.message);
+          });
+        }
+      } else if (type === "tool_use") {
+        structuredEvent = {
+          type: "tool_use",
+          name: parsed.name ?? "",
+          input: parsed.input ?? {},
+        };
+      } else if (type === "tool_result") {
+        structuredEvent = {
+          type: "tool_result",
+          content: parsed.content ?? "",
+        };
+      } else if (type === "result") {
+        const resultText = typeof parsed.result === "string" ? parsed.result : JSON.stringify(parsed.result ?? "");
+        structuredEvent = {
+          type: "result",
+          result: resultText,
+          is_error: parsed.is_error ?? false,
+        };
+        if (resultText) {
+          const msg = {
+            id: crypto.randomUUID(),
+            source: "claude" as const,
+            role: "assistant" as const,
+            content: resultText,
+            timestamp: new Date().toISOString(),
+            chatId: 0,
+          };
+          wire.discord.publishOutgoing(ns, msg).catch((err: Error) => {
+            console.warn(`[meta-agent-manager] publishOutgoing (result) failed (ns=${ns}):`, err.message);
+          });
+        }
+      } else {
+        structuredEvent = parsed;
+      }
+    } catch {
+      structuredEvent = { type: "text", text: trimmed };
+    }
+
+    forwardEventToRedis(JSON.stringify(structuredEvent));
+  };
+
+  let lineBuffer = "";
+
+  proc.stdout!.on("data", (chunk: Buffer) => {
+    lineBuffer += chunk.toString();
+    const lines = lineBuffer.split("\n");
+    lineBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      processLine(line);
+    }
+  });
+
+  proc.stderr!.on("data", (chunk: Buffer) => {
+    const text = chunk.toString().trim();
+    if (text) console.log(`[meta-agent-manager:${ns}:stderr] ${text}`);
+  });
+
+  proc.on("exit", () => {
+    // Flush remaining buffered content
+    if (lineBuffer.trim()) processLine(lineBuffer);
+    lineBuffer = "";
+  });
+}
+
+/**
  * Spawn `claude --continue -p "{message}" --dangerously-skip-permissions` in the
  * namespace workspace. Pipes stdout line-by-line → wire.discord.publishOutgoing.
  * Also streams each chunk to Redis: PUBLISH cca:meta:{ns}:stream and LPUSH cca:meta:{ns}:log.
  * Returns a Promise that resolves when the process exits.
+ *
+ * Kept for backwards-compat and direct integration-test usage.
  */
 export function spawnSession(ns: string, message: string, token: string, wire: Wire): Promise<void> {
   return new Promise((resolve, reject) => {
     const wsPath = workspacePath(ns);
     const claudeBin = resolveClaude();
-
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    if (token.startsWith("sk-ant-api")) {
-      env.ANTHROPIC_API_KEY = token;
-      delete env.CLAUDE_CODE_OAUTH_TOKEN;
-    } else {
-      env.CLAUDE_CODE_OAUTH_TOKEN = token;
-      delete env.ANTHROPIC_API_KEY;
-    }
+    const env = buildEnv(token);
 
     const proc = spawn(
       claudeBin,
@@ -175,121 +306,9 @@ export function spawnSession(ns: string, message: string, token: string, wire: W
       { cwd: wsPath, env, stdio: ["ignore", "pipe", "pipe"] }
     );
 
-    let lineBuffer = "";
-
-    /**
-     * Parse a JSONL line from claude's stream-json stdout into a structured event.
-     * For lines that fail JSON.parse, emit { type: "text", text: line }.
-     * Forward each event as a JSON string to Redis:
-     *   PUBLISH cca:meta:{ns}:stream
-     *   LPUSH   cca:meta:{ns}:log  (capped at 2000)
-     */
-    const rawRedis = wire._redis;
-    const streamCh = metaStreamChannel(ns);
-    const logKey = metaLogKey(ns);
-
-    const forwardEventToRedis = (eventJson: string): void => {
-      rawRedis.publish(streamCh, eventJson).catch((err: Error) => {
-        console.warn(`[meta-agent-manager] stream publish failed (ns=${ns}):`, err.message);
-      });
-      rawRedis.lpush(logKey, eventJson).then(() => {
-        rawRedis.ltrim(logKey, 0, 1999).catch(() => {});
-      }).catch((err: Error) => {
-        console.warn(`[meta-agent-manager] log lpush failed (ns=${ns}):`, err.message);
-      });
-    };
-
-    const processLine = (line: string): void => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
-
-      let structuredEvent: Record<string, unknown>;
-      try {
-        const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-        // Map claude stream-json event shapes to our canonical structured event format
-        const type = parsed.type as string | undefined;
-        if (type === "assistant") {
-          // Extract text from content blocks
-          const content = parsed.message as { content?: Array<{ type: string; text?: string }> } | undefined;
-          const textBlock = content?.content?.find((b) => b.type === "text");
-          const text = textBlock?.text ?? "";
-          structuredEvent = { type: "assistant", text };
-          // Also publish to Discord outgoing channel
-          if (text) {
-            const msg = {
-              id: crypto.randomUUID(),
-              source: "claude" as const,
-              role: "assistant" as const,
-              content: text,
-              timestamp: new Date().toISOString(),
-              chatId: 0,
-            };
-            wire.discord.publishOutgoing(ns, msg).catch((err: Error) => {
-              console.warn(`[meta-agent-manager] publishOutgoing failed (ns=${ns}):`, err.message);
-            });
-          }
-        } else if (type === "tool_use") {
-          structuredEvent = {
-            type: "tool_use",
-            name: parsed.name ?? "",
-            input: parsed.input ?? {},
-          };
-        } else if (type === "tool_result") {
-          structuredEvent = {
-            type: "tool_result",
-            content: parsed.content ?? "",
-          };
-        } else if (type === "result") {
-          const resultText = typeof parsed.result === "string" ? parsed.result : JSON.stringify(parsed.result ?? "");
-          structuredEvent = {
-            type: "result",
-            result: resultText,
-            is_error: parsed.is_error ?? false,
-          };
-          // Publish result text to Discord as final assistant message
-          if (resultText) {
-            const msg = {
-              id: crypto.randomUUID(),
-              source: "claude" as const,
-              role: "assistant" as const,
-              content: resultText,
-              timestamp: new Date().toISOString(),
-              chatId: 0,
-            };
-            wire.discord.publishOutgoing(ns, msg).catch((err: Error) => {
-              console.warn(`[meta-agent-manager] publishOutgoing (result) failed (ns=${ns}):`, err.message);
-            });
-          }
-        } else {
-          // Forward other event types as-is
-          structuredEvent = parsed;
-        }
-      } catch {
-        // Non-JSON line — wrap as text event
-        structuredEvent = { type: "text", text: trimmed };
-      }
-
-      forwardEventToRedis(JSON.stringify(structuredEvent));
-    };
-
-    proc.stdout.on("data", (chunk: Buffer) => {
-      lineBuffer += chunk.toString();
-      const lines = lineBuffer.split("\n");
-      lineBuffer = lines.pop() ?? "";
-      for (const line of lines) {
-        processLine(line);
-      }
-    });
-
-    proc.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString().trim();
-      if (text) console.log(`[meta-agent-manager:${ns}:stderr] ${text}`);
-    });
+    wireStdoutToRedis(proc, ns, wire);
 
     proc.on("exit", (code) => {
-      // Flush any remaining buffered content
-      if (lineBuffer.trim()) processLine(lineBuffer);
-      lineBuffer = "";
       console.log(`[meta-agent-manager] session exited (ns=${ns}, code=${code})`);
       resolve();
     });
@@ -301,6 +320,14 @@ export function spawnSession(ns: string, message: string, token: string, wire: W
   });
 }
 
+/**
+ * Internal state for a persistent Claude session.
+ */
+interface PersistentSession {
+  proc: ChildProcess;
+  ns: string;
+}
+
 export interface MetaAgentManager {
   ensureWorkspace: (ns: string, repoUrl: string) => Promise<void>;
   injectMcp: (ns: string, token: string) => void;
@@ -310,14 +337,177 @@ export interface MetaAgentManager {
     instanceId?: string
   ) => void;
   stop: () => void;
+  /** Kill and remove the persistent session for a namespace (e.g. on /clear). */
+  killSession: (ns: string) => void;
+  /** Write a raw line to the stdin of the running session, if any. */
+  sendToSession: (ns: string, line: string) => void;
 }
 
 /**
- * Create a MetaAgentManager that polls input queues and spawns sessions.
+ * Spawn a persistent `claude --continue` process for a namespace.
+ * No -p flag — messages are delivered via stdin.
+ * Stdout is wired to Redis via wireStdoutToRedis.
+ * Returns the ChildProcess.
+ */
+function spawnPersistentSession(
+  ns: string,
+  token: string,
+  wire: Wire,
+  onExit: () => void,
+): ChildProcess {
+  const wsPath = workspacePath(ns);
+  const claudeBin = resolveClaude();
+  const env = buildEnv(token);
+
+  console.log(`[meta-agent-manager] spawning persistent session (ns=${ns})`);
+
+  const proc = spawn(
+    claudeBin,
+    [
+      "--continue",
+      "--output-format", "stream-json",
+      "--verbose",
+      "--dangerously-skip-permissions",
+    ],
+    { cwd: wsPath, env, stdio: ["pipe", "pipe", "pipe"] }
+  );
+
+  // Set stdin encoding so we can write strings directly
+  proc.stdin!.setDefaultEncoding("utf8");
+
+  wireStdoutToRedis(proc, ns, wire);
+
+  proc.on("exit", (code) => {
+    console.log(`[meta-agent-manager] persistent session exited (ns=${ns}, code=${code})`);
+    onExit();
+  });
+
+  proc.on("error", (err: Error) => {
+    console.error(`[meta-agent-manager] persistent session spawn error (ns=${ns}):`, err.message);
+    onExit();
+  });
+
+  return proc;
+}
+
+/**
+ * Create a MetaAgentManager that maintains one persistent Claude process per namespace.
+ *
+ * On first message for a namespace:
+ *   1. ensureWorkspace + injectMcp
+ *   2. Drain any pending Redis queue entries to stdin
+ *   3. Write the new message to stdin
+ *
+ * On subsequent messages: write directly to stdin of the running process.
+ *
+ * On process exit: remove from sessions map. Next message triggers a respawn.
+ *
+ * The 3-second poll loop drains any messages that arrived while a session was
+ * starting up or temporarily unavailable.
  */
 export function createMetaAgentManager(): MetaAgentManager {
   let pollInterval: ReturnType<typeof setInterval> | null = null;
-  const activeNamespaces = new Set<string>();
+  /** One persistent ChildProcess per namespace. */
+  const sessions = new Map<string, PersistentSession>();
+  /** Namespaces currently being set up (workspace clone / first spawn). */
+  const startingUp = new Set<string>();
+
+  /**
+   * Write a line to the stdin of the persistent session for ns.
+   * Silently no-ops if no session exists.
+   */
+  function writeToStdin(ns: string, line: string): void {
+    const session = sessions.get(ns);
+    if (!session) return;
+    try {
+      session.proc.stdin!.write(`${line}\n`);
+    } catch (err) {
+      console.warn(`[meta-agent-manager] stdin write failed (ns=${ns}):`, (err as Error).message);
+    }
+  }
+
+  /**
+   * Drain all pending messages from the Redis input queue into the session's stdin.
+   */
+  async function drainQueue(ns: string, wire: Wire): Promise<void> {
+    const inputKey = discordMetaInputKey(ns);
+    for (;;) {
+      let raw: string | null;
+      try {
+        raw = await wire._redis.lpop(inputKey);
+      } catch {
+        break;
+      }
+      if (!raw) break;
+
+      let content: string;
+      try {
+        content = (JSON.parse(raw) as { content?: string }).content ?? raw;
+      } catch {
+        content = raw;
+      }
+
+      writeToStdin(ns, content);
+    }
+  }
+
+  /**
+   * Ensure a persistent session exists for ns.
+   * If one already exists, returns immediately.
+   * If not, spawns one, drains any queued messages, then writes `firstMessage` if provided.
+   */
+  async function ensureSession(
+    ns: string,
+    repoUrl: string,
+    token: string,
+    wire: Wire,
+    firstMessage?: string,
+  ): Promise<void> {
+    if (sessions.has(ns)) {
+      if (firstMessage !== undefined) writeToStdin(ns, firstMessage);
+      return;
+    }
+
+    if (startingUp.has(ns)) {
+      // Already spinning up — queue the message so drainQueue picks it up
+      return;
+    }
+
+    startingUp.add(ns);
+    try {
+      // Ensure workspace exists
+      const wsPath = workspacePath(ns);
+      await ensureWorkspace(ns, repoUrl);
+      injectMcp(ns, wsPath, token);
+
+      const proc = spawnPersistentSession(ns, token, wire, () => {
+        // On exit: remove from map so next message triggers a respawn
+        sessions.delete(ns);
+        console.log(`[meta-agent-manager] session removed from map (ns=${ns})`);
+      });
+
+      sessions.set(ns, { proc, ns });
+
+      // Drain any messages that arrived before this session started
+      await drainQueue(ns, wire);
+
+      // Write the triggering message last (after queue drain, in order)
+      if (firstMessage !== undefined) writeToStdin(ns, firstMessage);
+
+      await wire.discord.setStatus(ns, {
+        namespace: ns,
+        status: "running",
+        isTyping: true,
+        turnCount: 0,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error(`[meta-agent-manager] ensureSession failed (ns=${ns}):`, (err as Error).message);
+      sessions.delete(ns);
+    } finally {
+      startingUp.delete(ns);
+    }
+  }
 
   return {
     async ensureWorkspace(ns, repoUrl) {
@@ -337,82 +527,50 @@ export function createMetaAgentManager(): MetaAgentManager {
         if (namespaces.length === 0) return;
 
         for (const { namespace: ns, repoUrl } of namespaces) {
-          if (activeNamespaces.has(ns)) continue;
-
-          wire.discord.dequeue(ns)
-            .then(async (msg) => {
-              if (!msg) return;
-
-              // Staleness check: if a newer instance has registered, this process is stale — exit.
-              if (instanceId) {
-                try {
-                  const current = await wire._redis.get(DISCORD_INSTANCE_KEY);
-                  if (current && current !== instanceId) {
-                    console.log(`[meta-agent-manager] stale instance detected (current=${current}, ours=${instanceId}) — exiting`);
-                    process.exit(0);
-                  }
-                } catch {
-                  // Redis error — proceed anyway
-                }
+          // Stale-instance check
+          if (instanceId) {
+            wire._redis.get(DISCORD_INSTANCE_KEY).then((current) => {
+              if (current && current !== instanceId) {
+                console.log(`[meta-agent-manager] stale instance detected (current=${current}, ours=${instanceId}) — exiting`);
+                process.exit(0);
               }
-              const content = typeof msg === "string" ? msg : (msg as { content?: string }).content ?? String(msg);
+            }).catch(() => {});
+          }
 
-              activeNamespaces.add(ns);
-              await wire.discord.setStatus(ns, {
-                namespace: ns,
-                status: "running",
-                isTyping: true,
-                turnCount: 0,
-                updatedAt: new Date().toISOString(),
-              });
-
-              let token: string;
-              try {
-                token = await wire.token.getMaster();
-              } catch {
-                token = process.env.CLAUDE_CODE_OAUTH_TOKEN
-                  ?? process.env.CLAUDE_CODE_TOKEN
-                  ?? process.env.ANTHROPIC_API_KEY
-                  ?? "";
-              }
-
-              if (!token) {
-                console.warn(`[meta-agent-manager] no token available, skipping session for ns=${ns}`);
-                activeNamespaces.delete(ns);
-                await wire.discord.setStatus(ns, {
-                  namespace: ns,
-                  status: "idle",
-                  isTyping: false,
-                  turnCount: 0,
-                  updatedAt: new Date().toISOString(),
-                });
-                return;
-              }
-
-              // Ensure the workspace directory exists — idempotent if already cloned.
-              // This guards against the workspace being absent after a bot restart.
-              const wsPath = workspacePath(ns);
-              await ensureWorkspace(ns, repoUrl);
-              injectMcp(ns, wsPath, token);
-
-              spawnSession(ns, content, token, wire)
-                .catch((err: Error) => {
-                  console.error(`[meta-agent-manager] session error (ns=${ns}):`, err.message);
-                })
-                .finally(() => {
-                  activeNamespaces.delete(ns);
-                  wire.discord.setStatus(ns, {
-                    namespace: ns,
-                    status: "idle",
-                    isTyping: false,
-                    turnCount: 0,
-                    updatedAt: new Date().toISOString(),
-                  }).catch(() => {});
-                });
-            })
-            .catch((err: Error) => {
-              console.warn(`[meta-agent-manager] dequeue error (ns=${ns}):`, err.message);
+          // If session exists, drain any queued messages
+          if (sessions.has(ns)) {
+            drainQueue(ns, wire).catch((err: Error) => {
+              console.warn(`[meta-agent-manager] drainQueue error (ns=${ns}):`, err.message);
             });
+            continue;
+          }
+
+          // Check if anything is queued for this namespace
+          const inputKey = discordMetaInputKey(ns);
+          wire._redis.llen(inputKey).then(async (queueLen) => {
+            if (queueLen === 0) return;
+
+            // Resolve token
+            let token: string;
+            try {
+              token = await wire.token.getMaster();
+            } catch {
+              token = process.env.CLAUDE_CODE_OAUTH_TOKEN
+                ?? process.env.CLAUDE_CODE_TOKEN
+                ?? process.env.ANTHROPIC_API_KEY
+                ?? "";
+            }
+
+            if (!token) {
+              console.warn(`[meta-agent-manager] no token available, skipping session for ns=${ns}`);
+              return;
+            }
+
+            // ensureSession will drain the queue itself
+            await ensureSession(ns, repoUrl, token, wire);
+          }).catch((err: Error) => {
+            console.warn(`[meta-agent-manager] llen error (ns=${ns}):`, err.message);
+          });
         }
       }, TIMING.INPUT_POLL_INTERVAL_MS);
 
@@ -425,6 +583,34 @@ export function createMetaAgentManager(): MetaAgentManager {
         pollInterval = null;
         console.log("[meta-agent-manager] polling stopped");
       }
+      // Kill all active sessions
+      for (const [ns, session] of sessions) {
+        try {
+          session.proc.stdin!.end();
+          session.proc.kill();
+        } catch {
+          // ignore errors during shutdown
+        }
+        sessions.delete(ns);
+        console.log(`[meta-agent-manager] killed session on stop (ns=${ns})`);
+      }
+    },
+
+    killSession(ns) {
+      const session = sessions.get(ns);
+      if (!session) return;
+      try {
+        session.proc.stdin!.end();
+        session.proc.kill();
+      } catch {
+        // ignore
+      }
+      sessions.delete(ns);
+      console.log(`[meta-agent-manager] killed session (ns=${ns})`);
+    },
+
+    sendToSession(ns, line) {
+      writeToStdin(ns, line);
     },
   };
 }
