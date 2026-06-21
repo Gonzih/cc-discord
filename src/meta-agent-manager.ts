@@ -366,13 +366,13 @@ function spawnPersistentSession(
     [
       "--continue",
       "--output-format", "stream-json",
+      "--input-format", "stream-json",
       "--verbose",
       "--dangerously-skip-permissions",
     ],
     { cwd: wsPath, env, stdio: ["pipe", "pipe", "pipe"] }
   );
 
-  // Set stdin encoding so we can write strings directly
   proc.stdin!.setDefaultEncoding("utf8");
 
   wireStdoutToRedis(proc, ns, wire);
@@ -420,7 +420,9 @@ export function createMetaAgentManager(): MetaAgentManager {
     const session = sessions.get(ns);
     if (!session) return;
     try {
-      session.proc.stdin!.write(`${line}\n`);
+      // --input-format stream-json expects JSON lines: {"type":"user","message":"..."}
+      const payload = JSON.stringify({ type: "user", message: line });
+      session.proc.stdin!.write(`${payload}\n`);
     } catch (err) {
       console.warn(`[meta-agent-manager] stdin write failed (ns=${ns}):`, (err as Error).message);
     }
