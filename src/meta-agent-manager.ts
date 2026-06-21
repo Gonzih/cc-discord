@@ -361,13 +361,17 @@ function spawnPersistentSession(
 
   console.log(`[meta-agent-manager] spawning persistent session (ns=${ns})`);
 
+  // DO NOT ADD -p OR --input-format stream-json HERE.
+  // With -p + --input-format stream-json, Claude buffers all stdin until EOF before responding.
+  // Since the stdin pipe is never closed (it stays open for subsequent messages), Claude
+  // waits forever and never produces output. Interactive mode (no -p) reads one line at a
+  // time and responds immediately. Verified by direct test: `echo msg | claude --continue
+  // --output-format stream-json ...` responds correctly; the -p variant does not.
   const proc = spawn(
     claudeBin,
     [
       "--continue",
-      "-p",
       "--output-format", "stream-json",
-      "--input-format", "stream-json",
       "--verbose",
       "--dangerously-skip-permissions",
     ],
@@ -421,9 +425,8 @@ export function createMetaAgentManager(): MetaAgentManager {
     const session = sessions.get(ns);
     if (!session) return;
     try {
-      // --input-format stream-json expects: {"role":"user","content":"..."}
-      const payload = JSON.stringify({ role: "user", content: line });
-      session.proc.stdin!.write(`${payload}\n`);
+      // Interactive mode: plain text line, Claude reads it as user input
+      session.proc.stdin!.write(`${line}\n`);
     } catch (err) {
       console.warn(`[meta-agent-manager] stdin write failed (ns=${ns}):`, (err as Error).message);
     }
