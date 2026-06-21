@@ -365,6 +365,7 @@ function spawnPersistentSession(
     claudeBin,
     [
       "--continue",
+      "-p",
       "--output-format", "stream-json",
       "--input-format", "stream-json",
       "--verbose",
@@ -420,8 +421,8 @@ export function createMetaAgentManager(): MetaAgentManager {
     const session = sessions.get(ns);
     if (!session) return;
     try {
-      // --input-format stream-json expects JSON lines: {"type":"user","message":"..."}
-      const payload = JSON.stringify({ type: "user", message: line });
+      // --input-format stream-json expects JSON lines: {"role":"user","content":"..."}
+      const payload = JSON.stringify({ role: "user", content: line });
       session.proc.stdin!.write(`${payload}\n`);
     } catch (err) {
       console.warn(`[meta-agent-manager] stdin write failed (ns=${ns}):`, (err as Error).message);
