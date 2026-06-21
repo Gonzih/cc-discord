@@ -2,7 +2,7 @@
 
 Discord bot that bridges Discord channels to persistent Claude Code sessions. Each Discord channel maps to a namespace (GitHub repo). One persistent `claude --continue` process per namespace runs in `~/cc-discord-workspace/{ns}/` with MCP tools (gitkb + cc-agent) injected.
 
-**Version:** 0.2.35 | **Entry point:** `src/index.ts`
+**Version:** 0.2.39 | **Entry point:** `src/index.ts`
 
 ## Architecture
 
@@ -70,7 +70,7 @@ DEFAULT_GITHUB_ORG         # default: gonzih
 | `/loop list/pause/resume/delete` | Manage loops |
 | `/channel <repo_url>` | Create/register Discord channel for GitHub repo |
 | `/costs` | Show token usage + cost breakdown |
-| `/reset` | Kill local Claude session |
+| `/reset` | Kill persistent meta-agent session (preserves JSONL — respawns with `--continue` on next message) |
 | `/wiki [ns]` | Fetch namespace wiki |
 
 ## Cron/Loop Fire Pattern
@@ -148,6 +148,13 @@ Integration tests use `CLAUDE_BIN=test/fixtures/mock-claude.js`. Mock is configu
 - `MOCK_CLAUDE_RESPONSE` — output lines
 - `MOCK_CLAUDE_EXIT_CODE` — exit code
 - `MOCK_CLAUDE_DELAY_MS` — startup delay
+- `MOCK_CLAUDE_STDIN_MODE=1` — persistent session mode: stays alive, responds to each stdin line
+
+Voice tests inject mock binaries via:
+- `FFMPEG_BIN` — path to mock-ffmpeg.js fixture
+- `WHISPER_BIN` — path to mock-whisper.js fixture
+- `WHISPER_MODEL` — path to a dummy model file
+- `MOCK_WHISPER_RESPONSE` — text the mock whisper-cli writes to output
 
 **Redis isolation:** Integration tests MUST use Redis DB 1 (`redis://localhost:6379/1`), never DB 0 (production).
 
@@ -159,6 +166,22 @@ npm version patch      # bump version
 npm publish --access public
 ```
 
+## Session Architecture
+
+**cc-discord = persistent per channel/repo.** One `claude --continue` process per namespace stays alive across messages. Messages go to stdin; responses stream from stdout. Process survives between Discord messages — context accumulates in the JSONL file.
+
+**cc-agent = transient per job.** Short-lived processes, many in parallel. Each job spawns a new process and exits when done.
+
+**`/reset` vs `/clear`:**
+- `/reset` — kills the process only. JSONL preserved. Next message respawns with `--continue`, picking up the same context.
+- `/clear` — kills the process AND deletes the JSONL. Next message starts a fresh session with no prior context.
+
+## Voice Transcription (voice.ts)
+
+Pipeline: Discord CDN URL → `downloadFile()` (HTTP + redirect-following + file:// support) → ffmpeg 16kHz mono WAV → whisper-cli → read `.wav.txt` output → strip `[artifacts]` → return text.
+
+Binary search order (first found wins): env var overrides (`FFMPEG_BIN`, `WHISPER_BIN`, `WHISPER_MODEL`) take priority over standard system paths. This allows test injection without modifying system PATH.
+
 ## Common Gotchas
 
 - `--continue` flag on claude CLI maintains conversation history via JSONL file in workspace. Deleting the file (`/clear`) starts a fresh session.
@@ -166,3 +189,5 @@ npm publish --access public
 - Persistent session (stdin-open) approach: messages go to stdin, NOT as `-p` flag.
 - Crons and loops both RPUSH to the same input queue as Discord messages — same processing path.
 - `wire.discord.registerChannel()` uses camelCase field names — always use `repoUrl`, never `repo_url`.
+- gitkb MCP is ALWAYS injected into meta-agent workspaces via `injectMcp()`. The 0.2.36 failure removed it — 0.2.38+ restores it. Never remove gitkb from the MCP config.
+- whisper-cpp `.en.` models require `-l en`, not `-l auto` (auto fails on English-only models).

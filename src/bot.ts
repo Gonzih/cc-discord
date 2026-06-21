@@ -1099,8 +1099,17 @@ export class CcDiscordBot {
 
     switch (interaction.commandName) {
       case "reset": {
+        // Kill local DM session if any
         this.killSession(channelId);
-        await interaction.reply("Session reset. Send a message to start.");
+        // Kill persistent meta-agent session if this is a routed channel.
+        // Unlike /clear, we do NOT delete the JSONL — context is preserved.
+        // Next message will respawn with --continue, picking up the same history.
+        const resetNs = this.resolveNamespaceForChannel(channelId);
+        this.metaAgentManager.killSession(resetNs);
+        await interaction.reply(
+          `Session process killed for \`${resetNs}\`. Next message respawns with existing context intact.\n` +
+          `Use \`/clear\` to also wipe conversation history.`
+        );
         break;
       }
 
