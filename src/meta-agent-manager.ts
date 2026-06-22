@@ -409,17 +409,17 @@ function spawnPersistentSession(
 
   console.log(`[meta-agent-manager] spawning persistent session (ns=${ns})`);
 
-  // DO NOT ADD -p OR --input-format stream-json HERE.
-  // With -p + --input-format stream-json, Claude buffers all stdin until EOF before responding.
-  // Since the stdin pipe is never closed (it stays open for subsequent messages), Claude
-  // waits forever and never produces output. Interactive mode (no -p) reads one line at a
-  // time and responds immediately. Verified by direct test: `echo msg | claude --continue
-  // --output-format stream-json ...` responds correctly; the -p variant does not.
+  // --input-format stream-json: Claude reads newline-delimited JSON messages from stdin.
+  // Each message must be: {"type":"user","message":{"role":"user","content":"..."}}
+  // Claude responds immediately to each message and stays alive waiting for the next one.
+  // DO NOT omit --input-format stream-json: without it, Claude ignores stdin when the
+  // pipe stays open (no TTY), producing no output until stdin is closed (EOF).
   const proc = spawn(
     claudeBin,
     [
       "--continue",
       "--output-format", "stream-json",
+      "--input-format", "stream-json",
       "--verbose",
       "--dangerously-skip-permissions",
     ],
@@ -481,12 +481,13 @@ export function createMetaAgentManager(): MetaAgentManager {
    * Resets the inactivity timer so the watchdog doesn't kill a session
    * that just received a message but hasn't responded yet.
    */
-  function writeToStdin(ns: string, line: string): void {
+  function writeToStdin(ns: string, content: string): void {
     const session = sessions.get(ns);
     if (!session) return;
     try {
-      // Interactive mode: plain text line, Claude reads it as user input
-      session.proc.stdin!.write(`${line}\n`);
+      // --input-format stream-json: each message must be a newline-delimited JSON object.
+      const jsonMsg = JSON.stringify({ type: "user", message: { role: "user", content } });
+      session.proc.stdin!.write(`${jsonMsg}\n`);
       // Reset inactivity timer — the session now has SESSION_INACTIVITY_MS to respond
       session.lastOutputAt = Date.now();
     } catch (err) {

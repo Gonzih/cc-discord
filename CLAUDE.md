@@ -128,7 +128,7 @@ cca:token:master                 STR   — master Claude token (set at startup)
 2. Clone repo to `~/cc-discord-workspace/{ns}/` (skip if exists)
 3. `git-kb init` in workspace (gitkb local KB)
 4. Write `.mcp.json`
-5. Spawn `claude --continue --output-format stream-json` with stdin open
+5. Spawn `claude --continue --output-format stream-json --input-format stream-json` with stdin open
 6. Drain queued Redis messages → write each to stdin
 7. Stdout → JSONL parser → Redis pub/sub + log list + Discord via notifier
 8. On process exit: remove from sessions map; next message respawns
@@ -186,7 +186,7 @@ Binary search order (first found wins): env var overrides (`FFMPEG_BIN`, `WHISPE
 
 - `--continue` flag on claude CLI maintains conversation history via JSONL file in workspace. Deleting the file (`/clear`) starts a fresh session.
 - Token type matters: `sk-ant-api*` → `ANTHROPIC_API_KEY`; `sk-ant-oat*` → `CLAUDE_CODE_OAUTH_TOKEN`. Never set both.
-- Persistent session (stdin-open) approach: messages go to stdin, NOT as `-p` flag.
+- Persistent session stdin protocol: spawn with `--input-format stream-json`, write each message as `{"type":"user","message":{"role":"user","content":"..."}}`. Without `--input-format stream-json`, Claude ignores piped stdin (no TTY) and never responds. Never use plain text or `-p` flag.
 - Crons and loops both RPUSH to the same input queue as Discord messages — same processing path.
 - `wire.discord.registerChannel()` uses camelCase field names — always use `repoUrl`, never `repo_url`.
 - gitkb MCP is ALWAYS injected into meta-agent workspaces via `injectMcp()`. The 0.2.36 failure removed it — 0.2.38+ restores it. Never remove gitkb from the MCP config.
