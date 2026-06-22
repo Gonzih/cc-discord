@@ -246,51 +246,24 @@ function wireStdoutToRedis(
           result: resultText,
           is_error: parsed.is_error ?? false,
         };
-        if (resultText && !parsed.is_error) {
-          const msg = {
-            id: crypto.randomUUID(),
-            source: "claude" as const,
-            role: "assistant" as const,
-            content: resultText,
-            timestamp: new Date().toISOString(),
-            chatId: 0,
-          };
-          // Publish text first (logs to chat history), then signal done for immediate finalization
-          wire.discord.publishOutgoing(ns, msg).then(() => {
-            rawRedis.publish(discordChatOutgoing(ns), JSON.stringify({
-              id: crypto.randomUUID(), source: "claude", role: "assistant",
-              content: "", event: "done", timestamp: new Date().toISOString(), chatId: 0,
-            })).catch(() => {});
-          }).catch((err: Error) => {
-            console.warn(`[meta-agent-manager] publishOutgoing (result) failed (ns=${ns}):`, err.message);
-            // Still signal done even if text publish failed
-            rawRedis.publish(discordChatOutgoing(ns), JSON.stringify({
-              id: crypto.randomUUID(), source: "claude", role: "assistant",
-              content: "", event: "done", timestamp: new Date().toISOString(), chatId: 0,
-            })).catch(() => {});
-          });
-        } else if (parsed.is_error) {
-          // Error result: publish error text and signal done
+        if (parsed.is_error && resultText) {
+          // Error case: assistant event may not carry the error message — publish it directly
           const errMsg = {
             id: crypto.randomUUID(),
             source: "claude" as const,
             role: "assistant" as const,
-            content: `⚠️ Error: ${resultText || "unknown error"}`,
+            content: `⚠️ Error: ${resultText}`,
             timestamp: new Date().toISOString(),
             chatId: 0,
           };
           wire.discord.publishOutgoing(ns, errMsg).catch(() => {});
-          rawRedis.publish(discordChatOutgoing(ns), JSON.stringify({
-            id: crypto.randomUUID(), source: "claude", role: "assistant",
-            content: "", event: "done", timestamp: new Date().toISOString(), chatId: 0,
-          })).catch(() => {});
-        } else {
-          // Empty result — just signal done
-          rawRedis.publish(discordChatOutgoing(ns), JSON.stringify({
-            id: crypto.randomUUID(), source: "claude", role: "assistant",
-            content: "", event: "done", timestamp: new Date().toISOString(), chatId: 0,
-          })).catch(() => {});
         }
+        // Signal turn completion — text was already published via the assistant event above.
+        // Do NOT re-publish resultText here: that would double-deliver the same content.
+        rawRedis.publish(discordChatOutgoing(ns), JSON.stringify({
+          id: crypto.randomUUID(), source: "claude", role: "assistant",
+          content: "", event: "done", timestamp: new Date().toISOString(), chatId: 0,
+        })).catch(() => {});
       } else {
         structuredEvent = parsed;
       }
