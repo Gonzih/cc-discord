@@ -357,7 +357,6 @@ export function startNotifier(
     const buf = metaAgentBuffers.get(ns);
     if (!buf || !buf.text.trim()) return;
     const text = `← [${ns}] ` + stripAnsi(buf.text.trim());
-    if (text.length < 30) { buf.text = ""; buf.timer = null; return; }
     buf.text = "";
     buf.timer = null;
     // During an active loop, route meta-agent output to the thread rather than main channel

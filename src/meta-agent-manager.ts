@@ -326,6 +326,9 @@ export function spawnSession(ns: string, message: string, token: string, wire: W
 interface PersistentSession {
   proc: ChildProcess;
   ns: string;
+  /** Epoch ms of last stdout data received (or last stdin write). Reset on new input so
+   *  the watchdog doesn't kill a session that just got a message but hasn't responded yet. */
+  lastOutputAt: number;
 }
 
 export interface MetaAgentManager {
@@ -354,6 +357,7 @@ function spawnPersistentSession(
   token: string,
   wire: Wire,
   onExit: () => void,
+  onOutput?: () => void,
 ): ChildProcess {
   const wsPath = workspacePath(ns);
   const claudeBin = resolveClaude();
@@ -381,6 +385,10 @@ function spawnPersistentSession(
   proc.stdin!.setDefaultEncoding("utf8");
 
   wireStdoutToRedis(proc, ns, wire);
+
+  if (onOutput) {
+    proc.stdout!.on("data", onOutput);
+  }
 
   proc.on("exit", (code) => {
     console.log(`[meta-agent-manager] persistent session exited (ns=${ns}, code=${code})`);
@@ -410,16 +418,24 @@ function spawnPersistentSession(
  * The 3-second poll loop drains any messages that arrived while a session was
  * starting up or temporarily unavailable.
  */
+/** Kill a session after this many ms of no stdout (or no new stdin). */
+const SESSION_INACTIVITY_MS = 5 * 60_000; // 5 minutes
+
 export function createMetaAgentManager(): MetaAgentManager {
   let pollInterval: ReturnType<typeof setInterval> | null = null;
+  let watchdogInterval: ReturnType<typeof setInterval> | null = null;
   /** One persistent ChildProcess per namespace. */
   const sessions = new Map<string, PersistentSession>();
   /** Namespaces currently being set up (workspace clone / first spawn). */
   const startingUp = new Set<string>();
+  /** Wire reference needed for watchdog notifications. Set in startPolling. */
+  let wireRef: Wire | null = null;
 
   /**
    * Write a line to the stdin of the persistent session for ns.
    * Silently no-ops if no session exists.
+   * Resets the inactivity timer so the watchdog doesn't kill a session
+   * that just received a message but hasn't responded yet.
    */
   function writeToStdin(ns: string, line: string): void {
     const session = sessions.get(ns);
@@ -427,9 +443,49 @@ export function createMetaAgentManager(): MetaAgentManager {
     try {
       // Interactive mode: plain text line, Claude reads it as user input
       session.proc.stdin!.write(`${line}\n`);
+      // Reset inactivity timer — the session now has SESSION_INACTIVITY_MS to respond
+      session.lastOutputAt = Date.now();
     } catch (err) {
       console.warn(`[meta-agent-manager] stdin write failed (ns=${ns}):`, (err as Error).message);
     }
+  }
+
+  /**
+   * Watchdog: scan all sessions every 60s. If any session has been silent
+   * (no stdout and no new stdin) for SESSION_INACTIVITY_MS, kill it and
+   * notify Discord so the user can see why the session went quiet.
+   */
+  function startWatchdog(): void {
+    if (watchdogInterval) return;
+    watchdogInterval = setInterval(() => {
+      if (!wireRef) return;
+      const now = Date.now();
+      for (const [ns, session] of sessions) {
+        const idleMs = now - session.lastOutputAt;
+        if (idleMs < SESSION_INACTIVITY_MS) continue;
+        const idleMin = Math.round(idleMs / 60_000);
+        console.warn(`[meta-agent-manager] watchdog: ns=${ns} idle ${idleMin}m, killing stuck session`);
+        // Notify Discord before killing so the user knows what happened
+        const alertMsg = {
+          id: crypto.randomUUID(),
+          source: "claude" as const,
+          role: "assistant" as const,
+          content: `⚠️ Session for **${ns}** was idle for ${idleMin} minutes (likely stuck on a tool call). Killed and removed — send any message to restart.`,
+          timestamp: new Date().toISOString(),
+          chatId: 0,
+        };
+        wireRef.discord.publishOutgoing(ns, alertMsg).catch((err: Error) => {
+          console.warn(`[meta-agent-manager] watchdog publishOutgoing failed (ns=${ns}):`, err.message);
+        });
+        try {
+          session.proc.stdin!.end();
+          session.proc.kill("SIGTERM");
+        } catch {
+          // ignore kill errors
+        }
+        sessions.delete(ns);
+      }
+    }, 60_000);
   }
 
   /**
@@ -486,13 +542,23 @@ export function createMetaAgentManager(): MetaAgentManager {
       await ensureWorkspace(ns, repoUrl);
       injectMcp(ns, wsPath, token);
 
-      const proc = spawnPersistentSession(ns, token, wire, () => {
-        // On exit: remove from map so next message triggers a respawn
-        sessions.delete(ns);
-        console.log(`[meta-agent-manager] session removed from map (ns=${ns})`);
-      });
+      // Placeholder — filled in after proc is known so the onOutput closure can update it
+      let session: PersistentSession;
 
-      sessions.set(ns, { proc, ns });
+      const proc = spawnPersistentSession(ns, token, wire,
+        () => {
+          // On exit: remove from map so next message triggers a respawn
+          sessions.delete(ns);
+          console.log(`[meta-agent-manager] session removed from map (ns=${ns})`);
+        },
+        () => {
+          // Reset inactivity timer on any stdout data
+          if (session) session.lastOutputAt = Date.now();
+        },
+      );
+
+      session = { proc, ns, lastOutputAt: Date.now() };
+      sessions.set(ns, session);
 
       // Drain any messages that arrived before this session started
       await drainQueue(ns, wire);
@@ -527,6 +593,9 @@ export function createMetaAgentManager(): MetaAgentManager {
 
     startPolling(wire, getNamespaces, instanceId) {
       if (pollInterval) return; // already running
+
+      wireRef = wire;
+      startWatchdog();
 
       pollInterval = setInterval(() => {
         const namespaces = getNamespaces();
@@ -588,6 +657,10 @@ export function createMetaAgentManager(): MetaAgentManager {
         clearInterval(pollInterval);
         pollInterval = null;
         console.log("[meta-agent-manager] polling stopped");
+      }
+      if (watchdogInterval) {
+        clearInterval(watchdogInterval);
+        watchdogInterval = null;
       }
       // Kill all active sessions
       for (const [ns, session] of sessions) {
