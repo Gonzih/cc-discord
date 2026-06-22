@@ -642,13 +642,20 @@ export function createMetaAgentManager(): MetaAgentManager {
       wireRef = wire;
       startWatchdog();
 
+      // Grace period: don't run stale-instance check until 20s after startup.
+      // The instance key write (in index.ts "ready" handler) is async — if the poll
+      // loop fires before that write completes, this instance sees the OLD key,
+      // incorrectly thinks it's stale, and self-destructs (SIGTERM to all sessions).
+      const pollStartTime = Date.now();
+      const STALE_CHECK_GRACE_MS = 20_000;
+
       pollInterval = setInterval(() => {
         const namespaces = getNamespaces();
         if (namespaces.length === 0) return;
 
         for (const { namespace: ns, repoUrl } of namespaces) {
-          // Stale-instance check
-          if (instanceId) {
+          // Stale-instance check — skip during grace period
+          if (instanceId && Date.now() - pollStartTime > STALE_CHECK_GRACE_MS) {
             wire._redis.get(DISCORD_INSTANCE_KEY).then((current) => {
               if (current && current !== instanceId) {
                 console.log(`[meta-agent-manager] stale instance detected (current=${current}, ours=${instanceId}) — exiting`);
