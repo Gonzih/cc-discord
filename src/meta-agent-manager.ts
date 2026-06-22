@@ -22,6 +22,7 @@ import {
   TIMING,
   DISCORD_INSTANCE_KEY,
   discordMetaInputKey,
+  discordChatOutgoing,
   metaStreamChannel as ccWireMetaStreamChannel,
   metaLogKey as ccWireMetaLogKey,
 } from "@gonzih/cc-wire";
@@ -217,16 +218,27 @@ function wireStdoutToRedis(
           });
         }
       } else if (type === "tool_use") {
+        const toolName = (parsed.name as string) ?? "tool";
         structuredEvent = {
           type: "tool_use",
-          name: parsed.name ?? "",
+          name: toolName,
           input: parsed.input ?? {},
         };
+        // Ephemeral signal: notifier shows tool activity overlay in the live message
+        rawRedis.publish(discordChatOutgoing(ns), JSON.stringify({
+          id: crypto.randomUUID(), source: "claude", role: "assistant",
+          content: toolName, event: "tool_start", timestamp: new Date().toISOString(), chatId: 0,
+        })).catch(() => {});
       } else if (type === "tool_result") {
         structuredEvent = {
           type: "tool_result",
           content: parsed.content ?? "",
         };
+        // Ephemeral signal: tool finished, notifier can restart finalize timer
+        rawRedis.publish(discordChatOutgoing(ns), JSON.stringify({
+          id: crypto.randomUUID(), source: "claude", role: "assistant",
+          content: "", event: "tool_end", timestamp: new Date().toISOString(), chatId: 0,
+        })).catch(() => {});
       } else if (type === "result") {
         const resultText = typeof parsed.result === "string" ? parsed.result : JSON.stringify(parsed.result ?? "");
         structuredEvent = {
@@ -234,7 +246,7 @@ function wireStdoutToRedis(
           result: resultText,
           is_error: parsed.is_error ?? false,
         };
-        if (resultText) {
+        if (resultText && !parsed.is_error) {
           const msg = {
             id: crypto.randomUUID(),
             source: "claude" as const,
@@ -243,9 +255,41 @@ function wireStdoutToRedis(
             timestamp: new Date().toISOString(),
             chatId: 0,
           };
-          wire.discord.publishOutgoing(ns, msg).catch((err: Error) => {
+          // Publish text first (logs to chat history), then signal done for immediate finalization
+          wire.discord.publishOutgoing(ns, msg).then(() => {
+            rawRedis.publish(discordChatOutgoing(ns), JSON.stringify({
+              id: crypto.randomUUID(), source: "claude", role: "assistant",
+              content: "", event: "done", timestamp: new Date().toISOString(), chatId: 0,
+            })).catch(() => {});
+          }).catch((err: Error) => {
             console.warn(`[meta-agent-manager] publishOutgoing (result) failed (ns=${ns}):`, err.message);
+            // Still signal done even if text publish failed
+            rawRedis.publish(discordChatOutgoing(ns), JSON.stringify({
+              id: crypto.randomUUID(), source: "claude", role: "assistant",
+              content: "", event: "done", timestamp: new Date().toISOString(), chatId: 0,
+            })).catch(() => {});
           });
+        } else if (parsed.is_error) {
+          // Error result: publish error text and signal done
+          const errMsg = {
+            id: crypto.randomUUID(),
+            source: "claude" as const,
+            role: "assistant" as const,
+            content: `⚠️ Error: ${resultText || "unknown error"}`,
+            timestamp: new Date().toISOString(),
+            chatId: 0,
+          };
+          wire.discord.publishOutgoing(ns, errMsg).catch(() => {});
+          rawRedis.publish(discordChatOutgoing(ns), JSON.stringify({
+            id: crypto.randomUUID(), source: "claude", role: "assistant",
+            content: "", event: "done", timestamp: new Date().toISOString(), chatId: 0,
+          })).catch(() => {});
+        } else {
+          // Empty result — just signal done
+          rawRedis.publish(discordChatOutgoing(ns), JSON.stringify({
+            id: crypto.randomUUID(), source: "claude", role: "assistant",
+            content: "", event: "done", timestamp: new Date().toISOString(), chatId: 0,
+          })).catch(() => {});
         }
       } else {
         structuredEvent = parsed;

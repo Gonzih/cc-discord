@@ -348,63 +348,136 @@ export function startNotifier(
     }
   });
 
-  // Buffer for meta-agent streaming output — debounced before sending to Discord
-  const metaAgentBuffers = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> | null }>();
+  /**
+   * Live-stream state per namespace.
+   * One Discord message is created per namespace turn and edited in-place as Claude
+   * streams chunks. Tool activity is shown as an overlay on the same message.
+   * The message transforms: "⚙️ BashTool..." → "response ▋" → "response" (finalized).
+   */
+  interface LiveState {
+    text: string;              // accumulated text from this turn
+    toolStatus: string;        // active tool name ("" = idle)
+    targetChannelId: string;
+    starting: boolean;         // startOrGetLiveMessage call in flight
+    liveStarted: boolean;      // live message successfully created
+    finalTimer: ReturnType<typeof setTimeout> | null;
+  }
 
-  function flushMetaAgentBuffer(ns: string, targetChannelId: string): void {
-    const loopThreadId = bot.getLoopThreadId(targetChannelId);
-    bot.stopMetaAgentTyping(loopThreadId ?? targetChannelId);
-    const buf = metaAgentBuffers.get(ns);
-    if (!buf || !buf.text.trim()) return;
-    const text = `← [${ns}] ` + stripAnsi(buf.text.trim());
-    buf.text = "";
-    buf.timer = null;
-    // During an active loop, route meta-agent output to the thread rather than main channel
-    const deliverTo = bot.getLoopThreadId(targetChannelId) ?? targetChannelId;
-    const chunks = splitLongMessage(text);
-    for (const chunk of chunks) {
-      bot.sendWithFileDetection(deliverTo, chunk).catch((err: Error) => {
-        log("warn", `meta-agent flush sendWithFileDetection failed (ns=${ns}):`, err.message);
-      });
+  const liveStates = new Map<string, LiveState>();
+
+  function getLiveState(ns: string, targetChannelId: string): LiveState {
+    let state = liveStates.get(ns);
+    if (!state) {
+      state = { text: "", toolStatus: "", targetChannelId, starting: false, liveStarted: false, finalTimer: null };
+      liveStates.set(ns, state);
     }
+    return state;
+  }
+
+  async function finalizeState(ns: string, state: LiveState): Promise<void> {
+    if (state.finalTimer) { clearTimeout(state.finalTimer); state.finalTimer = null; }
+    liveStates.delete(ns);
+    const deliverTo = bot.getLoopThreadId(state.targetChannelId) ?? state.targetChannelId;
+    bot.stopMetaAgentTyping(deliverTo);
+    const trimmed = state.text.trim();
+    if (!trimmed && !state.liveStarted) return;
+    const fullText = trimmed ? `← [${ns}]\n${stripAnsi(trimmed)}` : "";
+    await bot.finalizeLiveMessage(deliverTo, fullText);
+  }
+
+  function scheduleFinal(ns: string, state: LiveState): void {
+    if (state.finalTimer) clearTimeout(state.finalTimer);
+    state.finalTimer = setTimeout(() => {
+      finalizeState(ns, state).catch((err: Error) => {
+        log("warn", `meta-agent finalize failed (ns=${ns}):`, err.message);
+      });
+    }, TIMING.META_AGENT_FLUSH_DELAY_MS);
   }
 
   sub.on("pmessage", (pattern: string, channel: string, message: string) => {
     void pattern;
     const ns = channel.slice(outgoingPrefix.length);
 
-    let parsed: { source?: string; content?: string } | null = null;
+    let parsed: { source?: string; content?: string; event?: string } | null = null;
     try {
-      parsed = JSON.parse(message) as { source?: string; content?: string };
+      parsed = JSON.parse(message) as { source?: string; content?: string; event?: string };
     } catch {
       return;
     }
 
-    if (parsed.source !== "claude") return;
-    const content = parsed.content;
-    if (!content) return;
+    if (parsed?.source !== "claude") return;
 
-    // For the primary namespace: deliver to the primary Discord channel.
-    // For other (routed) namespaces: only deliver to explicitly registered channelIds.
     const targetChannelId = routedChannelIds.get(ns) ??
       (ns === namespace ? (notifyChannelId ?? getActiveChannelId?.()) : undefined);
 
     if (targetChannelId == null) {
-      log("warn", `meta-agent output: no channelId for namespace=${ns}, dropping line`);
+      log("warn", `meta-agent output: no channelId for namespace=${ns}, dropping`);
       return;
     }
 
-    let buf = metaAgentBuffers.get(ns);
-    if (!buf) {
-      buf = { text: "", timer: null };
-      metaAgentBuffers.set(ns, buf);
+    const deliverTo = bot.getLoopThreadId(targetChannelId) ?? targetChannelId;
+    const state = getLiveState(ns, targetChannelId);
+    const event = parsed.event;
+
+    // tool_start: show activity overlay, suspend finalize timer
+    if (event === "tool_start") {
+      const toolName = parsed.content || "tool";
+      state.toolStatus = toolName;
+      if (state.finalTimer) { clearTimeout(state.finalTimer); state.finalTimer = null; }
+      if (state.liveStarted) {
+        const textPart = state.text.trim() ? `← [${ns}]\n${stripAnsi(state.text.trim())}\n\n` : "";
+        bot.updateLiveMessage(deliverTo, `${textPart}⚙️ \`${toolName}\`...`);
+      } else if (!state.starting) {
+        state.starting = true;
+        bot.startOrGetLiveMessage(deliverTo, `⚙️ \`${toolName}\`...`).then((msg) => {
+          state.starting = false;
+          if (msg) state.liveStarted = true;
+        }).catch(() => { state.starting = false; });
+      }
+      return;
     }
-    buf.text += (buf.text ? "\n" : "") + content;
-    if (buf.timer) clearTimeout(buf.timer);
-    buf.timer = setTimeout(
-      () => flushMetaAgentBuffer(ns, targetChannelId),
-      TIMING.META_AGENT_FLUSH_DELAY_MS
-    );
+
+    // tool_end: clear overlay, resume finalize timer if text is pending
+    if (event === "tool_end") {
+      state.toolStatus = "";
+      if (state.text.trim()) scheduleFinal(ns, state);
+      return;
+    }
+
+    // done: immediate finalization (fired by meta-agent-manager after result event)
+    if (event === "done") {
+      finalizeState(ns, state).catch((err: Error) => {
+        log("warn", `meta-agent done finalize failed (ns=${ns}):`, err.message);
+      });
+      return;
+    }
+
+    // Regular text chunk: accumulate, update live message
+    const content = parsed.content;
+    if (!content) return;
+
+    state.toolStatus = ""; // text arrived — clear any tool overlay
+    state.text += (state.text ? "\n" : "") + content;
+    const textDisplay = `← [${ns}]\n${stripAnsi(state.text)} ▋`;
+
+    if (!state.liveStarted) {
+      if (!state.starting) {
+        state.starting = true;
+        // startOrGetLiveMessage reuses existing message if tool_start created one
+        bot.startOrGetLiveMessage(deliverTo, textDisplay).then((msg) => {
+          state.starting = false;
+          if (msg) {
+            state.liveStarted = true;
+            bot.updateLiveMessage(deliverTo, textDisplay);
+          }
+        }).catch(() => { state.starting = false; });
+      }
+      // Text is buffered in state.text; applied when startOrGetLiveMessage resolves
+    } else {
+      bot.updateLiveMessage(deliverTo, textDisplay);
+    }
+
+    scheduleFinal(ns, state);
   });
 
   // Poll discordNotify(ns) LIST every 5 seconds — covers primary + all routed namespaces.

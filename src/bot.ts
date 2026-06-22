@@ -325,6 +325,14 @@ export class CcDiscordBot {
   /** Typing intervals for meta-agent routed channels — keyed by channelId. */
   private metaAgentTypingTimers = new Map<string, ReturnType<typeof setInterval>>();
 
+  /** Live Discord messages per channel — edited in-place as Claude streams output. */
+  private liveMessages = new Map<string, {
+    msg: Message;
+    lastEditAt: number;
+    editTimer: ReturnType<typeof setTimeout> | null;
+    pendingText: string | null;
+  }>();
+
   /** Start (or reset) the typing indicator for a meta-agent–routed channel. */
   private startMetaAgentTyping(channelId: string, channel: SendableChannel): void {
     this.stopMetaAgentTyping(channelId);
@@ -341,6 +349,88 @@ export class CcDiscordBot {
     if (timer) {
       clearInterval(timer);
       this.metaAgentTypingTimers.delete(channelId);
+    }
+  }
+
+  /**
+   * Get or create a live Discord message for `channelId`.
+   * If a live message already exists (e.g. from a tool_start), returns it (for reuse).
+   * Otherwise sends `initial` to create the placeholder and stops the typing indicator.
+   */
+  public async startOrGetLiveMessage(channelId: string, initial: string): Promise<Message | null> {
+    const existing = this.liveMessages.get(channelId);
+    if (existing) return existing.msg;
+    const channel = await this.getChannel(channelId);
+    if (!channel) return null;
+    this.stopMetaAgentTyping(channelId);
+    try {
+      const msg = await (channel as TextChannel).send(initial || "▋");
+      this.liveMessages.set(channelId, { msg, lastEditAt: Date.now(), editTimer: null, pendingText: null });
+      return msg;
+    } catch (err) {
+      console.warn(`[bot] startOrGetLiveMessage failed (${channelId}):`, (err as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Throttled edit of the live message for `channelId`.
+   * Safe to call on every token/chunk — edits are coalesced at 750ms intervals.
+   * The latest `text` always wins (older pending updates are replaced).
+   */
+  public updateLiveMessage(channelId: string, text: string): void {
+    const entry = this.liveMessages.get(channelId);
+    if (!entry) return;
+    entry.pendingText = text;
+    if (entry.editTimer) return; // timer already scheduled; will pick up pendingText when it fires
+    const msUntilSafe = Math.max(0, 750 - (Date.now() - entry.lastEditAt));
+    entry.editTimer = setTimeout(async () => {
+      entry.editTimer = null;
+      const t = entry.pendingText;
+      if (t == null) return;
+      entry.pendingText = null;
+      try {
+        await entry.msg.edit(t.slice(0, 1990));
+        entry.lastEditAt = Date.now();
+      } catch {
+        this.liveMessages.delete(channelId); // message deleted or perms lost — give up
+      }
+    }, msUntilSafe);
+  }
+
+  /**
+   * Final edit of the live message — applies `text` without cursor, clears tracker.
+   * If no live message exists, falls back to sendWithFileDetection (new message).
+   * Overflow past 2000 chars spawns continuation messages via sendToChannelById.
+   */
+  public async finalizeLiveMessage(channelId: string, text: string): Promise<void> {
+    const entry = this.liveMessages.get(channelId);
+    if (entry?.editTimer) { clearTimeout(entry.editTimer); entry.editTimer = null; }
+    this.liveMessages.delete(channelId);
+
+    if (!entry) {
+      if (text.trim()) await this.sendWithFileDetection(channelId, text);
+      return;
+    }
+
+    if (!text.trim()) {
+      // Nothing to show — delete the placeholder message
+      entry.msg.delete().catch(() => {});
+      return;
+    }
+
+    const formatted = formatForDiscord(text);
+    const chunks = splitLongMessage(formatted);
+    try {
+      await entry.msg.edit(chunks[0]);
+      for (const chunk of chunks.slice(1)) {
+        if (chunk.trim()) await this.sendToChannelById(channelId, chunk);
+      }
+    } catch {
+      // Message was deleted or edit failed — send as new messages
+      for (const chunk of chunks) {
+        if (chunk.trim()) await this.sendWithFileDetection(channelId, chunk).catch(() => {});
+      }
     }
   }
 
