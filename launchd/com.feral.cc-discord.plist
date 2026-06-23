@@ -24,8 +24,12 @@
     <string>FILL_IN_TUESDAY</string>
     <key>CLAUDE_CODE_OAUTH_TOKEN</key>
     <string>FILL_IN_TUESDAY</string>
-    <key>CC_AGENT_NAMESPACE</key>
+    <key>CC_DISCORD_NAMESPACE</key>
     <string>money-brain</string>
+    <key>ATC_BIN</key>
+    <string>/Users/feral/.cargo/bin/atc</string>
+    <key>ATC_ROOT</key>
+    <string>/Users/feral/.local/share/atc</string>
     <key>CWD</key>
     <string>/Users/feral/money-brain</string>
     <key>DEFAULT_GITHUB_ORG</key>

@@ -31,6 +31,7 @@ import { resolve, basename, join } from "path";
 import { homedir } from "os";
 import https from "https";
 import http from "http";
+import { execFile } from "child_process";
 import { Redis } from "ioredis";
 import { createCcWire } from "@gonzih/cc-wire";
 import { ClaudeProcess, extractText, ClaudeMessage, UsageEvent } from "./claude.js";
@@ -42,7 +43,7 @@ import { CronManager } from "./cron.js";
 import { CronEngine, cronPendingKey, CRON_MESSAGE_TTL } from "./cron-engine.js";
 import { LoopEngine, loopPendingKey, LOOP_MESSAGE_TTL, parseIntervalMs } from "./loop-engine.js";
 import { parseChannelCreateIntent, routeToMetaAgent } from "./router.js";
-import { createMetaAgentManager, type MetaAgentManager } from "./meta-agent-manager.js";
+import { createMetaAgentManager, workspacePath, type MetaAgentManager } from "./meta-agent-manager.js";
 
 type SendableChannel = TextChannel | DMChannel | NewsChannel | ThreadChannel | VoiceChannel;
 
@@ -61,6 +62,48 @@ const PRICING = {
   cacheWritePerM: 3.75,
 };
 
+function envPositiveNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const LIVE_EDIT_MAX_PER_MINUTE = envPositiveNumber("CC_DISCORD_LIVE_EDIT_MAX_PER_MINUTE", 80);
+const LIVE_EDIT_SAFETY_FACTOR = Math.min(0.95, Math.max(0.5, envPositiveNumber("CC_DISCORD_LIVE_EDIT_SAFETY_FACTOR", 0.8)));
+const LIVE_EDIT_MIN_INTERVAL_MS = Math.max(
+  750,
+  Math.ceil(60_000 / Math.max(1, LIVE_EDIT_MAX_PER_MINUTE * LIVE_EDIT_SAFETY_FACTOR))
+);
+const LIVE_EDIT_INITIAL_BACKOFF_MS = envPositiveNumber("CC_DISCORD_LIVE_EDIT_INITIAL_BACKOFF_MS", 1_500);
+const LIVE_EDIT_MAX_BACKOFF_MS = envPositiveNumber("CC_DISCORD_LIVE_EDIT_MAX_BACKOFF_MS", 60_000);
+
+function discordRetryAfterMs(err: unknown): number | null {
+  const record = err as {
+    retryAfter?: unknown;
+    retry_after?: unknown;
+    rawError?: { retry_after?: unknown };
+    response?: { headers?: { get?: (name: string) => string | null } };
+  };
+  const candidates = [
+    record.retryAfter,
+    record.retry_after,
+    record.rawError?.retry_after,
+    record.response?.headers?.get?.("retry-after"),
+  ];
+  for (const candidate of candidates) {
+    const value = typeof candidate === "string" ? Number(candidate) : candidate;
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      return value < 1_000 ? Math.ceil(value * 1_000) : Math.ceil(value);
+    }
+  }
+  return null;
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
 interface SessionCost {
   totalInputTokens: number;
   totalOutputTokens: number;
@@ -77,6 +120,91 @@ function computeCostUsd(usage: UsageEvent): number {
     usage.cacheReadTokens * PRICING.cacheReadPerM / 1_000_000 +
     usage.cacheWriteTokens * PRICING.cacheWritePerM / 1_000_000
   );
+}
+
+function resolveAtcBin(): string {
+  if (process.env.ATC_BIN) return process.env.ATC_BIN;
+  const dirs = (process.env.PATH ?? "").split(":").filter(Boolean);
+  for (const dir of dirs) {
+    const candidate = join(dir, "atc");
+    if (existsSync(candidate)) return candidate;
+  }
+  const fallbacks = [
+    `${homedir()}/.cargo/bin/atc`,
+    "/opt/homebrew/bin/atc",
+    "/usr/local/bin/atc",
+    "/usr/bin/atc",
+  ];
+  for (const candidate of fallbacks) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return "atc";
+}
+
+function resolveGitKbBin(): string {
+  if (process.env.GITKB_BIN) return process.env.GITKB_BIN;
+  const dirs = (process.env.PATH ?? "").split(":").filter(Boolean);
+  for (const dir of dirs) {
+    const candidate = join(dir, "git-kb");
+    if (existsSync(candidate)) return candidate;
+  }
+  return "/opt/homebrew/bin/git-kb";
+}
+
+function execText(command: string, args: string[], opts: { cwd: string; env?: NodeJS.ProcessEnv; timeoutMs?: number }): Promise<string> {
+  return new Promise((resolvePromise, reject) => {
+    execFile(command, args, {
+      cwd: opts.cwd,
+      env: opts.env ?? process.env,
+      timeout: opts.timeoutMs ?? 20_000,
+      maxBuffer: 512 * 1024,
+    }, (err, stdout, stderr) => {
+      if (err) {
+        const detail = stderr.toString().trim() || err.message;
+        reject(new Error(detail));
+        return;
+      }
+      resolvePromise(stdout.toString().trim());
+    });
+  });
+}
+
+function splitCliArgs(input: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let quote: "'" | "\"" | null = null;
+  let escaped = false;
+  for (const ch of input.trim()) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if ((ch === "'" || ch === "\"") && !quote) {
+      quote = ch;
+      continue;
+    }
+    if (quote === ch) {
+      quote = null;
+      continue;
+    }
+    if (/\s/.test(ch) && !quote) {
+      if (current) {
+        args.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (quote) throw new Error("Unclosed quote in ATC args");
+  if (escaped) current += "\\";
+  if (current) args.push(current);
+  return args;
 }
 
 interface Session {
@@ -328,10 +456,75 @@ export class CcDiscordBot {
   /** Live Discord messages per channel — edited in-place as Claude streams output. */
   private liveMessages = new Map<string, {
     msg: Message;
-    lastEditAt: number;
-    editTimer: ReturnType<typeof setTimeout> | null;
-    pendingText: string | null;
   }>();
+
+  private liveEditQueue = new Map<string, { msg: Message; text: string }>();
+  private liveEditTimer: ReturnType<typeof setTimeout> | null = null;
+  private nextLiveEditAt = 0;
+  private liveEditBackoffMs = 0;
+
+  private liveMessageKey(channelId: string, slot = "response"): string {
+    return `${channelId}:${slot}`;
+  }
+
+  private liveEditFailureDelayMs(err: unknown): number {
+    const retryAfter = discordRetryAfterMs(err);
+    const backoff = retryAfter ?? (this.liveEditBackoffMs > 0
+      ? Math.min(this.liveEditBackoffMs * 2, LIVE_EDIT_MAX_BACKOFF_MS)
+      : LIVE_EDIT_INITIAL_BACKOFF_MS);
+    const jitter = Math.floor(backoff * 0.1 * Math.random());
+    this.liveEditBackoffMs = Math.min(backoff, LIVE_EDIT_MAX_BACKOFF_MS);
+    return this.liveEditBackoffMs + jitter;
+  }
+
+  private async editLiveMessageWithPacing(channelId: string, msg: Message, text: string, maxAttempts = 3): Promise<void> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const delay = Math.max(0, this.nextLiveEditAt - Date.now());
+      if (delay > 0) await sleepMs(delay);
+      try {
+        await msg.edit(text);
+        this.liveEditBackoffMs = 0;
+        this.nextLiveEditAt = Date.now() + LIVE_EDIT_MIN_INTERVAL_MS;
+        return;
+      } catch (err) {
+        const retryDelay = this.liveEditFailureDelayMs(err);
+        this.nextLiveEditAt = Date.now() + retryDelay;
+        console.warn(`[bot] live message edit failed (${channelId}); retrying in ${retryDelay}ms:`, (err as Error).message);
+        if (attempt === maxAttempts) throw err;
+      }
+    }
+  }
+
+  private enqueueLiveEdit(channelId: string, msg: Message, text: string): void {
+    this.liveEditQueue.set(channelId, { msg, text: text.slice(0, 1990) });
+    this.scheduleLiveEditDrain();
+  }
+
+  private scheduleLiveEditDrain(): void {
+    if (this.liveEditTimer || this.liveEditQueue.size === 0) return;
+    const delay = Math.max(0, this.nextLiveEditAt - Date.now());
+    this.liveEditTimer = setTimeout(() => {
+      this.liveEditTimer = null;
+      void this.drainOneLiveEdit();
+    }, delay);
+  }
+
+  private async drainOneLiveEdit(): Promise<void> {
+    const next = this.liveEditQueue.entries().next();
+    if (next.done) return;
+
+    const [key, entry] = next.value;
+    this.liveEditQueue.delete(key);
+    try {
+      await this.editLiveMessageWithPacing(key, entry.msg, entry.text, 1);
+    } catch (err) {
+      if (!this.liveEditQueue.has(key) && this.liveMessages.get(key)?.msg.id === entry.msg.id) {
+        this.liveEditQueue.set(key, entry);
+      }
+    } finally {
+      this.scheduleLiveEditDrain();
+    }
+  }
 
   /** Start (or reset) the typing indicator for a meta-agent–routed channel. */
   private startMetaAgentTyping(channelId: string, channel: SendableChannel): void {
@@ -357,45 +550,34 @@ export class CcDiscordBot {
    * If a live message already exists (e.g. from a tool_start), returns it (for reuse).
    * Otherwise sends `initial` to create the placeholder and stops the typing indicator.
    */
-  public async startOrGetLiveMessage(channelId: string, initial: string): Promise<Message | null> {
-    const existing = this.liveMessages.get(channelId);
+  public async startOrGetLiveMessage(channelId: string, initial: string, slot = "response"): Promise<Message | null> {
+    const key = this.liveMessageKey(channelId, slot);
+    const existing = this.liveMessages.get(key);
     if (existing) return existing.msg;
     const channel = await this.getChannel(channelId);
     if (!channel) return null;
     this.stopMetaAgentTyping(channelId);
     try {
       const msg = await (channel as TextChannel).send(initial || "▋");
-      this.liveMessages.set(channelId, { msg, lastEditAt: Date.now(), editTimer: null, pendingText: null });
+      this.liveMessages.set(key, { msg });
+      this.nextLiveEditAt = Math.max(this.nextLiveEditAt, Date.now() + LIVE_EDIT_MIN_INTERVAL_MS);
       return msg;
     } catch (err) {
-      console.warn(`[bot] startOrGetLiveMessage failed (${channelId}):`, (err as Error).message);
+      console.warn(`[bot] startOrGetLiveMessage failed (${key}):`, (err as Error).message);
       return null;
     }
   }
 
   /**
    * Throttled edit of the live message for `channelId`.
-   * Safe to call on every token/chunk — edits are coalesced at 750ms intervals.
-   * The latest `text` always wins (older pending updates are replaced).
+   * Safe to call on every token/chunk — edits are coalesced behind one global
+   * paced queue. The latest `text` always wins for each live message.
    */
-  public updateLiveMessage(channelId: string, text: string): void {
-    const entry = this.liveMessages.get(channelId);
+  public updateLiveMessage(channelId: string, text: string, slot = "response"): void {
+    const key = this.liveMessageKey(channelId, slot);
+    const entry = this.liveMessages.get(key);
     if (!entry) return;
-    entry.pendingText = text;
-    if (entry.editTimer) return; // timer already scheduled; will pick up pendingText when it fires
-    const msUntilSafe = Math.max(0, 750 - (Date.now() - entry.lastEditAt));
-    entry.editTimer = setTimeout(async () => {
-      entry.editTimer = null;
-      const t = entry.pendingText;
-      if (t == null) return;
-      entry.pendingText = null;
-      try {
-        await entry.msg.edit(t.slice(0, 1990));
-        entry.lastEditAt = Date.now();
-      } catch {
-        this.liveMessages.delete(channelId); // message deleted or perms lost — give up
-      }
-    }, msUntilSafe);
+    this.enqueueLiveEdit(key, entry.msg, text);
   }
 
   /**
@@ -403,10 +585,11 @@ export class CcDiscordBot {
    * If no live message exists, falls back to sendWithFileDetection (new message).
    * Overflow past 2000 chars spawns continuation messages via sendToChannelById.
    */
-  public async finalizeLiveMessage(channelId: string, text: string): Promise<void> {
-    const entry = this.liveMessages.get(channelId);
-    if (entry?.editTimer) { clearTimeout(entry.editTimer); entry.editTimer = null; }
-    this.liveMessages.delete(channelId);
+  public async finalizeLiveMessage(channelId: string, text: string, slot = "response"): Promise<void> {
+    const key = this.liveMessageKey(channelId, slot);
+    const entry = this.liveMessages.get(key);
+    this.liveMessages.delete(key);
+    this.liveEditQueue.delete(key);
 
     if (!entry) {
       if (text.trim()) await this.sendWithFileDetection(channelId, text);
@@ -422,7 +605,7 @@ export class CcDiscordBot {
     const formatted = formatForDiscord(text);
     const chunks = splitLongMessage(formatted);
     try {
-      await entry.msg.edit(chunks[0]);
+      await this.editLiveMessageWithPacing(key, entry.msg, chunks[0]);
       for (const chunk of chunks.slice(1)) {
         if (chunk.trim()) await this.sendToChannelById(channelId, chunk);
       }
@@ -1026,7 +1209,7 @@ export class CcDiscordBot {
     const commands = [
       new SlashCommandBuilder().setName("reset").setDescription("Reset Claude session for this channel"),
       new SlashCommandBuilder().setName("costs").setDescription("Show token usage and cost for this channel"),
-      new SlashCommandBuilder().setName("mcp_status").setDescription("Check MCP server connection status"),
+      new SlashCommandBuilder().setName("mcp_status").setDescription("Check GitKB and ATC integration status"),
       new SlashCommandBuilder()
         .setName("crons")
         .setDescription("Manage cron jobs")
@@ -1051,6 +1234,32 @@ export class CcDiscordBot {
         .setName("wiki")
         .setDescription("Wiki page info (pass namespace to look up)")
         .addStringOption((opt) => opt.setName("namespace").setDescription("Namespace to look up").setRequired(false)),
+      new SlashCommandBuilder()
+        .setName("atc")
+        .setDescription("Inspect or control ATC dispatches")
+        .addSubcommand((sub) =>
+          sub.setName("status").setDescription("Show active ATC dispatches")
+        )
+        .addSubcommand((sub) =>
+          sub
+            .setName("dryrun")
+            .setDescription("Preview an ATC run command without dispatching")
+            .addStringOption((opt) =>
+              opt.setName("args").setDescription("Arguments after `atc`, e.g. run task tasks/foo").setRequired(true)
+            )
+        )
+        .addSubcommand((sub) =>
+          sub
+            .setName("logs")
+            .setDescription("Show ATC logs for a task slug or dispatch ID")
+            .addStringOption((opt) => opt.setName("id").setDescription("Task slug or dispatch ID").setRequired(true))
+        )
+        .addSubcommand((sub) =>
+          sub
+            .setName("health")
+            .setDescription("Run ATC health checks")
+            .addBooleanOption((opt) => opt.setName("auto").setDescription("Auto-dispatch review-fix for NeedsReview records"))
+        ),
       new SlashCommandBuilder()
         .setName("channel")
         .setDescription("Create a Discord channel for a GitHub repo meta-agent")
@@ -1212,10 +1421,10 @@ export class CcDiscordBot {
       case "mcp_status": {
         await interaction.deferReply();
         try {
-          const result = await this.callCcAgentTool("get_version");
-          await interaction.editReply(result ? `MCP connected. Version: ${result}` : "MCP connected (no version info).");
+          const result = await this.integrationStatus();
+          await interaction.editReply(result);
         } catch (err) {
-          await interaction.editReply(`MCP unavailable: ${(err as Error).message}`);
+          await interaction.editReply(`Integration check failed: ${(err as Error).message}`);
         }
         break;
       }
@@ -1229,7 +1438,7 @@ export class CcDiscordBot {
         await interaction.deferReply();
         const ns = interaction.options.getString("namespace") ?? this.namespace;
         try {
-          const result = await this.callCcAgentTool("get_wiki", { namespace: ns });
+          const result = await this.getWikiContent(ns);
           if (result) {
             const chunks = splitLongMessage(result);
             await interaction.editReply(chunks[0]);
@@ -1242,6 +1451,11 @@ export class CcDiscordBot {
         } catch (err) {
           await interaction.editReply(`Wiki lookup failed: ${(err as Error).message}`);
         }
+        break;
+      }
+
+      case "atc": {
+        await this.handleAtcCommand(interaction);
         break;
       }
 
@@ -1542,45 +1756,99 @@ export class CcDiscordBot {
     }
   }
 
-  /**
-   * Call a cc-agent MCP tool via a dedicated ClaudeProcess.
-   * Returns the tool result as a string, or null on failure.
-   */
-  public async callCcAgentTool(toolName: string, args: Record<string, unknown> = {}): Promise<string | null> {
-    return new Promise((resolve) => {
-      const prompt = `Use the ${toolName} tool with these arguments: ${JSON.stringify(args)}. Return only the raw result, no extra commentary.`;
+  private atcEnv(ns?: string): NodeJS.ProcessEnv {
+    const root = ns ? workspacePath(ns) : (this.opts.cwd ?? process.cwd());
+    return {
+      ...process.env,
+      GITKB_ROOT: process.env.GITKB_ROOT ?? root,
+      DISPATCH_KB_ROOT: process.env.DISPATCH_KB_ROOT ?? root,
+      DISPATCH_META_ROOT: process.env.DISPATCH_META_ROOT ?? root,
+      ATC_NO_PAGER: "1",
+      NO_COLOR: "1",
+    };
+  }
 
-      const claude = new ClaudeProcess({
-        cwd: this.opts.cwd ?? process.cwd(),
-        token: this.opts.claudeToken ?? getCurrentToken(),
+  private async integrationStatus(): Promise<string> {
+    const cwd = this.opts.cwd ?? process.cwd();
+    const gitkb = await execText(resolveGitKbBin(), ["--version"], { cwd, timeoutMs: 10_000 });
+    const atc = await execText(resolveAtcBin(), ["--version"], { cwd, env: this.atcEnv(), timeoutMs: 10_000 });
+    const status = await execText(resolveAtcBin(), ["status", "--flat", "--no-pager", "--color", "never"], {
+      cwd,
+      env: this.atcEnv(),
+      timeoutMs: 15_000,
+    }).catch((err: Error) => `ATC status unavailable: ${err.message}`);
+    return [
+      `GitKB: ${gitkb || "available"}`,
+      `ATC: ${atc || "available"}`,
+      "",
+      "ATC status:",
+      status || "No active dispatches.",
+    ].join("\n");
+  }
+
+  private async getWikiContent(ns: string): Promise<string | null> {
+    const root = workspacePath(ns);
+    const candidates = [`wiki/${ns}`, `wiki/${ns}.md`, ns];
+    for (const slug of candidates) {
+      const result = await execText(resolveGitKbBin(), ["show", slug], {
+        cwd: root,
+        env: { ...process.env, GITKB_ROOT: root, NO_COLOR: "1" },
+        timeoutMs: 15_000,
+      }).catch(() => "");
+      if (result) return result;
+    }
+
+    const list = await execText(resolveGitKbBin(), ["list", "--path", "wiki", "--format", "ids"], {
+      cwd: root,
+      env: { ...process.env, GITKB_ROOT: root, NO_COLOR: "1" },
+      timeoutMs: 15_000,
+    }).catch(() => "");
+    return list || null;
+  }
+
+  private async handleAtcCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    await interaction.deferReply();
+    const ns = this.resolveNamespaceForChannel(interaction.channelId);
+    const cwd = workspacePath(ns);
+    const sub = interaction.options.getSubcommand();
+    const args = ["--no-pager", "--color", "never"];
+
+    if (sub === "status") {
+      args.push("status", "--flat");
+    } else if (sub === "dryrun") {
+      const raw = interaction.options.getString("args", true);
+      const parsed = splitCliArgs(raw);
+      if (parsed[0] === "atc") parsed.shift();
+      if (parsed[0] !== "run") {
+        await interaction.editReply("Dry-run only supports `atc run ...`. Example: `/atc dryrun args:run task tasks/foo`.");
+        return;
+      }
+      args.push(...parsed);
+      if (!args.includes("--dry-run")) args.push("--dry-run");
+    } else if (sub === "logs") {
+      args.push("logs", interaction.options.getString("id", true));
+    } else if (sub === "health") {
+      args.push("health");
+      if (interaction.options.getBoolean("auto") ?? false) args.push("--auto");
+    } else {
+      await interaction.editReply("Unknown /atc subcommand.");
+      return;
+    }
+
+    try {
+      const output = await execText(resolveAtcBin(), args, {
+        cwd,
+        env: this.atcEnv(ns),
+        timeoutMs: sub === "logs" ? 20_000 : 30_000,
       });
-
-      let result = "";
-      const timeout = setTimeout(() => {
-        claude.kill();
-        resolve(null);
-      }, 30_000);
-
-      claude.on("message", (msg: ClaudeMessage) => {
-        if (msg.type === "result") {
-          result = extractText(msg) || result;
-        } else if (msg.type === "assistant") {
-          result += extractText(msg);
-        }
-      });
-
-      claude.on("exit", () => {
-        clearTimeout(timeout);
-        resolve(result.trim() || null);
-      });
-
-      claude.on("error", () => {
-        clearTimeout(timeout);
-        resolve(null);
-      });
-
-      claude.sendPrompt(prompt);
-    });
+      const chunks = splitLongMessage(output || "No ATC output.");
+      await interaction.editReply(chunks[0]);
+      for (const chunk of chunks.slice(1)) {
+        await interaction.followUp(chunk);
+      }
+    } catch (err) {
+      await interaction.editReply(`ATC command failed: ${(err as Error).message}`);
+    }
   }
 
   private runCronTask(channelId: string, prompt: string, done: () => void): void {
@@ -1745,7 +2013,7 @@ export class CcDiscordBot {
   }
 
   /**
-   * Forward a cc-agent job notification into an existing Claude session.
+   * Forward an ATC/job notification into an existing Claude session.
    * Unlike handleUserMessage, this never creates a new session.
    */
   public forwardNotification(channelId: string, text: string): void {

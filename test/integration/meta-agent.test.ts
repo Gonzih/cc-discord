@@ -37,6 +37,7 @@ import { CronEngine } from "../../src/cron-engine.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const MOCK_CLAUDE_BIN = resolve(__dirname, "../fixtures/mock-claude.js");
+const MOCK_CODEX_BIN = resolve(__dirname, "../fixtures/mock-codex.js");
 
 // ─── Redis setup ──────────────────────────────────────────────────────────────
 
@@ -231,6 +232,122 @@ describe("spawnSession — CLAUDE_BIN override + Redis streaming", () => {
       } else {
         delete process.env.CLAUDE_BIN;
       }
+    }
+  });
+});
+
+describe("spawnSession — CODEX_BIN override + Redis streaming", () => {
+  it("spawns mock codex and streams item.completed output to Redis log key", async () => {
+    if (!redisAvailable) {
+      console.log("[skip] Redis unavailable at", REDIS_URL);
+      return;
+    }
+
+    const origDriver = process.env.CC_DISCORD_AGENT_DRIVER;
+    const origCodexBin = process.env.CODEX_BIN;
+    const origMockResp = process.env.MOCK_CODEX_RESPONSE;
+
+    process.env.CC_DISCORD_AGENT_DRIVER = "codex";
+    process.env.CODEX_BIN = MOCK_CODEX_BIN;
+    process.env.MOCK_CODEX_RESPONSE = "hello from mock codex";
+
+    const TEST_NS = "cc-discord-test-codex-spawn";
+    const logKey = track(metaLogKey(TEST_NS));
+
+    const { homedir } = await import("os");
+    const { join } = await import("path");
+    const { mkdirSync } = await import("fs");
+    const wsPath = join(homedir(), "cc-discord-workspace", TEST_NS);
+    mkdirSync(wsPath, { recursive: true });
+
+    const wire = createCcWire(redis);
+
+    try {
+      await spawnSession(TEST_NS, "hello", "", wire);
+
+      const entries = await redis.lrange(logKey, 0, -1);
+      expect(entries.length).toBeGreaterThan(0);
+
+      const allText = entries
+        .map((e) => {
+          try {
+            const parsed = JSON.parse(e) as { item?: { text?: string } };
+            return parsed.item?.text ?? "";
+          } catch {
+            return "";
+          }
+        })
+        .join("");
+
+      expect(allText).toContain("hello from mock codex");
+    } finally {
+      if (origDriver !== undefined) process.env.CC_DISCORD_AGENT_DRIVER = origDriver;
+      else delete process.env.CC_DISCORD_AGENT_DRIVER;
+      if (origCodexBin !== undefined) process.env.CODEX_BIN = origCodexBin;
+      else delete process.env.CODEX_BIN;
+      if (origMockResp !== undefined) process.env.MOCK_CODEX_RESPONSE = origMockResp;
+      else delete process.env.MOCK_CODEX_RESPONSE;
+    }
+  });
+});
+
+describe("MetaAgentManager — Codex app-server persistent session", () => {
+  it("drains Redis input into one Codex app-server session and streams JSON notifications", async () => {
+    if (!redisAvailable) {
+      console.log("[skip] Redis unavailable at", REDIS_URL);
+      return;
+    }
+
+    const origDriver = process.env.CC_DISCORD_AGENT_DRIVER;
+    const origCodexBin = process.env.CODEX_BIN;
+    const origMockResp = process.env.MOCK_CODEX_RESPONSE;
+
+    process.env.CC_DISCORD_AGENT_DRIVER = "codex";
+    process.env.CODEX_BIN = MOCK_CODEX_BIN;
+    process.env.MOCK_CODEX_RESPONSE = "persistent codex response";
+
+    const TEST_NS = "cc-discord-test-codex-manager";
+    const inputKey = track(`cca:discord:meta:${TEST_NS}:input`);
+    const logKey = track(metaLogKey(TEST_NS));
+
+    const { homedir } = await import("os");
+    const { join } = await import("path");
+    const { mkdirSync } = await import("fs");
+    mkdirSync(join(homedir(), "cc-discord-workspace", TEST_NS), { recursive: true });
+
+    const wire = createCcWire(redis);
+    const manager = createMetaAgentManager();
+
+    try {
+      await redis.rpush(inputKey, JSON.stringify({
+        id: "codex-1",
+        content: "hello codex app-server",
+        timestamp: new Date().toISOString(),
+        source: "test",
+      }));
+
+      manager.startPolling(
+        wire,
+        () => [{ namespace: TEST_NS, repoUrl: "https://github.com/test/test" }],
+        undefined
+      );
+
+      await new Promise((r) => setTimeout(r, 800));
+
+      const entries = await redis.lrange(logKey, 0, -1);
+      const parsed = entries.map((e) => JSON.parse(e) as { method?: string; params?: { delta?: string } });
+      expect(parsed.some((e) => e.method === "thread/started")).toBe(true);
+      expect(parsed.some((e) => e.method === "turn/started")).toBe(true);
+      expect(parsed.some((e) => e.method === "item/agentMessage/delta" && e.params?.delta === "persistent codex response")).toBe(true);
+      expect(parsed.some((e) => e.method === "turn/completed")).toBe(true);
+    } finally {
+      manager.stop();
+      if (origDriver !== undefined) process.env.CC_DISCORD_AGENT_DRIVER = origDriver;
+      else delete process.env.CC_DISCORD_AGENT_DRIVER;
+      if (origCodexBin !== undefined) process.env.CODEX_BIN = origCodexBin;
+      else delete process.env.CODEX_BIN;
+      if (origMockResp !== undefined) process.env.MOCK_CODEX_RESPONSE = origMockResp;
+      else delete process.env.MOCK_CODEX_RESPONSE;
     }
   });
 });

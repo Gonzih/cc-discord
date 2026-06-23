@@ -1,23 +1,27 @@
 #!/usr/bin/env node
 /**
- * cc-discord — Claude Code Discord bot
+ * cc-discord — Discord bot for Claude Code or Codex routed agents
  *
  * Usage:
  *   npx @gonzih/cc-discord
  *
  * Required env:
  *   DISCORD_BOT_TOKEN          — from Discord Developer Portal
- *   CLAUDE_CODE_OAUTH_TOKEN    — your Claude Code OAuth token (or ANTHROPIC_API_KEY)
+ *   CLAUDE_CODE_OAUTH_TOKEN    — Claude Code OAuth token (or ANTHROPIC_API_KEY) when using Claude
+ *   CODEX_API_KEY              — optional Codex API key when using Codex automation
  *
  * Optional env:
  *   DISCORD_GUILD_IDS          — comma-separated Discord guild/server IDs (for instant slash command registration)
  *   DISCORD_ALLOWED_USER_IDS   — comma-separated Discord user IDs to whitelist (leave empty to allow all)
  *   DISCORD_NOTIFY_CHANNEL_ID  — Discord channel ID for job notifications
- *   CC_AGENT_NAMESPACE         — primary namespace (default: money-brain)
+ *   CC_DISCORD_NAMESPACE      — primary namespace (default: money-brain)
  *   REDIS_URL                  — Redis connection URL (default: redis://localhost:6379)
- *   CWD                        — working directory for Claude Code (default: process.cwd())
+ *   CWD                        — working directory for local sessions (default: process.cwd())
  *   DEFAULT_GITHUB_ORG         — default GitHub org for #repo routing (default: gonzih)
- *   CC_DISCORD_MCP_JSON        — JSON template for .mcp.json injection into workspaces
+ *   CC_DISCORD_AGENT_DRIVER    — claude (default) or codex for routed meta-agents
+ *   ATC_BIN                   — optional, override ATC binary path
+ *   ATC_ROOT                  — optional, ATC data directory
+ *   CC_DISCORD_MCP_JSON       — JSON template for .mcp.json injection into workspaces
  */
 
 import { createRequire } from "node:module";
@@ -51,13 +55,14 @@ Set them and run again:
 }
 
 const discordToken = required("DISCORD_BOT_TOKEN");
+const agentDriver = (process.env.CC_DISCORD_AGENT_DRIVER ?? process.env.AGENT_DRIVER ?? "claude").toLowerCase();
 
 const claudeToken =
   process.env.CLAUDE_CODE_TOKEN ??
   process.env.CLAUDE_CODE_OAUTH_TOKEN ??
   process.env.ANTHROPIC_API_KEY;
 
-if (!claudeToken) {
+if (agentDriver !== "codex" && !claudeToken) {
   console.error(`
 ERROR: No Claude token set. Set one of: CLAUDE_CODE_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, or ANTHROPIC_API_KEY.
 `);
@@ -80,7 +85,7 @@ const allowedUserIds = process.env.DISCORD_ALLOWED_USER_IDS
 
 const cwd = process.env.CWD ?? process.cwd();
 const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
-const namespace = process.env.CC_AGENT_NAMESPACE || "money-brain";
+const namespace = process.env.CC_DISCORD_NAMESPACE || "money-brain";
 const notifyChannelId = process.env.DISCORD_NOTIFY_CHANNEL_ID ?? null;
 
 // Redis
@@ -118,9 +123,11 @@ sharedRedis.once("ready", () => {
   }, INSTANCE_REFRESH_MS);
 
   // Store master token so MetaAgentManager can retrieve it
-  wire.token.setMaster(claudeToken!).catch((err: Error) => {
-    console.warn("[cc-discord] failed to set master token:", err.message);
-  });
+  if (claudeToken) {
+    wire.token.setMaster(claudeToken).catch((err: Error) => {
+      console.warn("[cc-discord] failed to set master token:", err.message);
+    });
+  }
 
   // Run startup migrations (async, best-effort)
   void runStartupMigrations();

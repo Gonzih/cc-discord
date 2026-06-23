@@ -1,6 +1,6 @@
 # cc-discord
 
-Discord bot that bridges Discord channels to persistent Claude Code sessions. Each Discord channel maps to a namespace (GitHub repo). One persistent `claude --continue` process per namespace runs in `~/cc-discord-workspace/{ns}/` with MCP tools (gitkb + cc-agent) injected.
+Discord bot that bridges Discord channels to persistent Claude Code or Codex sessions. Each Discord channel maps to a namespace (GitHub repo). One persistent agent process per namespace runs in `~/cc-discord-workspace/{ns}/` with GitKB MCP injected. Delegated or parallel agent work goes through ATC.
 
 **Version:** 0.2.39 | **Entry point:** `src/index.ts`
 
@@ -20,7 +20,7 @@ MetaAgentManager (3s poll loop)
 
 DiscordNotifier
   → subscribe to cca:discord:chat:outgoing:* (meta-agent stdout → Discord)
-  → poll cca:discord:notify:{ns} (job completions → Discord)
+  → poll cca:discord:notify:{ns} (ATC/job completions → Discord)
   → poll cca:notify:{ns} (legacy pub/sub)
 ```
 
@@ -30,8 +30,8 @@ DiscordNotifier
 |------|------|
 | `src/index.ts` | Entry: env validation, Redis, startup migrations, wire everything |
 | `src/bot.ts` | Discord.js client, slash commands, session management, cost tracking |
-| `src/meta-agent-manager.ts` | Persistent claude --continue per namespace, stdin/stdout IPC |
-| `src/notifier.ts` | Redis pub/sub bridge — forwards job completions + meta-agent output to Discord |
+| `src/meta-agent-manager.ts` | Persistent Claude/Codex per namespace, stdin/stdout IPC |
+| `src/notifier.ts` | Redis pub/sub bridge — forwards ATC/job completions + meta-agent output to Discord |
 | `src/router.ts` | `routeToMetaAgent()` RPUSH + `parseChannelCreateIntent()` |
 | `src/cron-engine.ts` | Redis-persisted cron jobs (node-cron), fires by RPUSH to input queue |
 | `src/loop-engine.ts` | Redis-persisted interval loops (setInterval), fires immediately on create/resume |
@@ -50,10 +50,13 @@ CLAUDE_CODE_OAUTH_TOKENS   # optional, comma-separated pool for rotation
 DISCORD_GUILD_IDS          # optional, comma-separated (restricts slash command registration)
 DISCORD_ALLOWED_USER_IDS   # optional, comma-separated allowlist
 DISCORD_NOTIFY_CHANNEL_ID  # optional, default notification target
-CC_AGENT_NAMESPACE         # default: "money-brain"
+CC_DISCORD_NAMESPACE      # default: "money-brain"
 REDIS_URL                  # default: redis://localhost:6379
 CC_DISCORD_MCP_JSON        # optional, full JSON override for .mcp.json template
 CLAUDE_BIN                 # optional, override claude binary path (used in tests)
+CODEX_BIN                  # optional, override codex binary path (used in tests)
+ATC_BIN                    # optional, override atc binary path
+ATC_ROOT                   # optional, ATC data directory
 DEFAULT_GITHUB_ORG         # default: gonzih
 ```
 
@@ -85,22 +88,34 @@ MetaAgentManager picks it up → writes to stdin of running session
 
 Auto-compact: every `compact_every` fires, also pushes `/compact` first.
 
-## MCP Injection
+## GitKB + ATC Injection
 
 Written to `{workspace}/.mcp.json` by `injectMcp()`:
 ```json
 {
   "mcpServers": {
-    "gitkb": { "command": "/opt/homebrew/bin/git-kb", "args": ["mcp"] },
-    "cc-agent": {
-      "command": "/opt/homebrew/bin/npx",
-      "args": ["-y", "--prefer-online", "@gonzih/cc-agent"],
-      "env": { "CC_AGENT_NAMESPACE": "{ns}", "CWD": "{wsPath}", ... }
+    "gitkb": {
+      "command": "/opt/homebrew/bin/git-kb",
+      "args": ["mcp"],
+      "env": { "GITKB_ROOT": "{wsPath}", "DISPATCH_KB_ROOT": "{wsPath}", ... }
     }
   }
 }
 ```
-Extra servers merged from `~/.config/cc-discord-mcp.json` (gmail, github, etc.).
+
+Codex workspaces also get `{workspace}/.codex/config.toml`, `{workspace}/.atc/config.toml`, and `AGENTS.md`. ATC is a private local/cloud dispatcher, not a public cc-discord dependency to vendor. Agents should call the installed `atc` binary:
+
+```bash
+GITKB_ROOT=$PWD atc run task <slug>
+GITKB_ROOT=$PWD atc run research task <slug>
+GITKB_ROOT=$PWD atc run pr-review --param pr=<url>
+atc status --flat
+atc logs <slug-or-id>
+```
+
+Dry-run first when resolver/target repo is unclear: `atc run <args> --dry-run`.
+
+Harnesses should use dry-runs as the ATC discovery interface. Run the candidate command with `--dry-run`, inspect resolver/directive/worktree/repo, revise the command, and dry-run again until the output matches intent. Do not dispatch if the resolver falls through to raw `prompt` unless raw-prompt dispatch was explicitly intended.
 
 ## Redis Keys
 
@@ -114,7 +129,7 @@ cca:discord:cron:list            SET   — cron IDs
 cca:discord:cron:{id}            HASH  — CronRecord
 cca:discord:loop:list            SET   — loop IDs
 cca:discord:loop:{id}            HASH  — LoopRecord
-cca:discord:notify:{ns}          LIST  — job notifications (polled 5s)
+cca:discord:notify:{ns}          LIST  — ATC/job notifications (polled 5s)
 cca:discord:chat:outgoing:{ns}   CHAN  — meta-agent responses (pub/sub)
 cca:discord:instance             STR   — singleton UUID (30s TTL, refreshed 10s)
 cca:token:master                 STR   — master Claude token (set at startup)
@@ -127,7 +142,7 @@ cca:token:master                 STR   — master Claude token (set at startup)
 1. First message arrives for namespace → `ensureSession(ns, repoUrl, token, wire)`
 2. Clone repo to `~/cc-discord-workspace/{ns}/` (skip if exists)
 3. `git-kb init` in workspace (gitkb local KB)
-4. Write `.mcp.json`
+4. Write `.mcp.json`, `.codex/config.toml`, `.atc/config.toml`, and `AGENTS.md`
 5. Spawn `claude --continue --output-format stream-json --input-format stream-json` with stdin open
 6. Drain queued Redis messages → write each to stdin
 7. Stdout → JSONL parser → Redis pub/sub + log list + Discord via notifier
@@ -170,7 +185,9 @@ npm publish --access public
 
 **cc-discord = persistent per channel/repo.** One `claude --continue` process per namespace stays alive across messages. Messages go to stdin; responses stream from stdout. Process survives between Discord messages — context accumulates in the JSONL file.
 
-**cc-agent = transient per job.** Short-lived processes, many in parallel. Each job spawns a new process and exits when done.
+**ATC = delegated/parallel work.** ATC owns isolated dispatches, worktrees, monitoring, retries, and PR review loops. cc-discord exposes ATC status/log/health commands and prompts agents to use the installed `atc` binary for spawned work.
+
+**ATC dry-run loop.** Before launching delegated work, run `atc run ... --dry-run` one or more times to learn the resolver result and effective config. The dry-run transcript is the source of truth for what ATC will do.
 
 **`/reset` vs `/clear`:**
 - `/reset` — kills the process only. JSONL preserved. Next message respawns with `--continue`, picking up the same context.
@@ -189,5 +206,6 @@ Binary search order (first found wins): env var overrides (`FFMPEG_BIN`, `WHISPE
 - Persistent session stdin protocol: spawn with `--input-format stream-json`, write each message as `{"type":"user","message":{"role":"user","content":"..."}}`. Without `--input-format stream-json`, Claude ignores piped stdin (no TTY) and never responds. Never use plain text or `-p` flag.
 - Crons and loops both RPUSH to the same input queue as Discord messages — same processing path.
 - `wire.discord.registerChannel()` uses camelCase field names — always use `repoUrl`, never `repo_url`.
-- gitkb MCP is ALWAYS injected into meta-agent workspaces via `injectMcp()`. The 0.2.36 failure removed it — 0.2.38+ restores it. Never remove gitkb from the MCP config.
+- gitkb MCP is ALWAYS injected into meta-agent workspaces via `injectMcp()`. Never remove gitkb from the MCP config.
+- Do not reintroduce the legacy job-agent package or UI as a runtime dependency. ATC is the dispatcher path from now on.
 - whisper-cpp `.en.` models require `-l en`, not `-l auto` (auto fails on English-only models).

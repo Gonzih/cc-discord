@@ -5,8 +5,8 @@
 
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { existsSync, createWriteStream } from "fs";
-import { unlink, readFile, access } from "fs/promises";
+import { existsSync, createWriteStream, readdirSync } from "fs";
+import { unlink, readFile, access, mkdir } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import https from "https";
@@ -14,15 +14,30 @@ import http from "http";
 
 const execFileAsync = promisify(execFile);
 
-// Env var overrides allow test injection: WHISPER_BIN, FFMPEG_BIN, WHISPER_MODEL
+// Env var overrides allow test injection: WHISPER_BIN, FFMPEG_BIN, WHISPER_MODEL.
+// WHISPER_MODEL may point to either a model file or a directory containing ggml*.bin.
+const WHISPER_MODEL_NAMES = [
+  "ggml-small.en.bin",
+  "ggml-small.bin",
+  "ggml-base.en.bin",
+  "ggml-base.bin",
+  "ggml-tiny.en.bin",
+  "ggml-tiny.bin",
+];
+
 const WHISPER_MODELS = [
   process.env.WHISPER_MODEL,
+  process.env.WHISPER_MODEL_DIR,
   "/opt/homebrew/share/whisper-cpp/ggml-small.en.bin",
   "/opt/homebrew/share/whisper-cpp/ggml-small.bin",
   "/opt/homebrew/share/whisper-cpp/ggml-base.en.bin",
   "/opt/homebrew/share/whisper-cpp/ggml-base.bin",
+  "/opt/homebrew/share/whisper-cpp",
+  "/usr/local/share/whisper-cpp",
   `${process.env.HOME}/.local/share/whisper-cpp/ggml-small.en.bin`,
   `${process.env.HOME}/.local/share/whisper-cpp/ggml-base.en.bin`,
+  `${process.env.HOME}/.local/share/whisper-cpp`,
+  `${process.env.HOME}/Library/Application Support/whisper-cpp`,
 ].filter(Boolean) as string[];
 
 const WHISPER_BIN_CANDIDATES = [
@@ -41,6 +56,15 @@ const FFMPEG_CANDIDATES = [
   "/usr/bin/ffmpeg",
 ].filter(Boolean) as string[];
 
+const WHISPER_DOWNLOAD_CANDIDATES = [
+  process.env.WHISPER_DOWNLOAD_BIN,
+  "/opt/homebrew/bin/whisper-cpp-download-ggml-model",
+  "/usr/local/bin/whisper-cpp-download-ggml-model",
+].filter(Boolean) as string[];
+
+const DEFAULT_WHISPER_MODEL_URL = process.env.WHISPER_MODEL_URL ||
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin";
+
 function findBin(candidates: string[]): string | null {
   for (const p of candidates) {
     if (existsSync(p)) return p;
@@ -50,9 +74,42 @@ function findBin(candidates: string[]): string | null {
 
 function findModel(): string | null {
   for (const p of WHISPER_MODELS) {
-    if (existsSync(p)) return p;
+    if (!existsSync(p)) continue;
+    try {
+      const entries = readdirSync(p, { withFileTypes: true });
+      const model = WHISPER_MODEL_NAMES.find((name) => entries.some((entry) => entry.isFile() && entry.name === name));
+      if (model) return join(p, model);
+      const anyModel = entries.find((entry) =>
+        entry.isFile() &&
+        /ggml.*\.bin$/i.test(entry.name) &&
+        !entry.name.startsWith("for-tests-")
+      );
+      if (anyModel) return join(p, anyModel.name);
+    } catch {
+      return p;
+    }
   }
   return null;
+}
+
+async function ensureModel(): Promise<string | null> {
+  const existing = findModel();
+  if (existing) return existing;
+  if (process.env.NODE_ENV === "test" && process.env.WHISPER_ALLOW_DOWNLOAD !== "1") return null;
+
+  const downloader = findBin(WHISPER_DOWNLOAD_CANDIDATES);
+  const modelDir = process.env.WHISPER_MODEL_DIR || `${process.env.HOME}/.local/share/whisper-cpp`;
+  await mkdir(modelDir, { recursive: true });
+  if (downloader) {
+    await execFileAsync(downloader, ["small.en"], {
+      cwd: modelDir,
+      timeout: 10 * 60_000,
+      maxBuffer: 1024 * 1024,
+    });
+  } else {
+    await downloadFile(DEFAULT_WHISPER_MODEL_URL, join(modelDir, "ggml-small.en.bin"));
+  }
+  return findModel();
 }
 
 /**
@@ -102,7 +159,7 @@ export async function transcribeVoice(fileUrl: string): Promise<string> {
   const ffmpegBin = findBin(FFMPEG_CANDIDATES);
   if (!ffmpegBin) throw new Error("ffmpeg not found — install with: brew install ffmpeg");
 
-  const model = findModel();
+  const model = await ensureModel();
   if (!model) throw new Error("No whisper model found — run: whisper-cpp-download-ggml-model small.en");
 
   const tmp = join(tmpdir(), `cc-discord-voice-${Date.now()}`);

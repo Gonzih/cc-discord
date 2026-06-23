@@ -4,7 +4,7 @@
  * Supports CLAUDE_CODE_OAUTH_TOKENS (comma-separated list of tokens).
  * Falls back to CLAUDE_CODE_OAUTH_TOKEN for single-token / backwards compat.
  *
- * cc-tg token pool rotates independently from cc-agent's pool. No coordination between them.
+ * cc-tg token pool rotates independently from cc-discord's local session pool.
  */
 
 let tokens: string[] = [];

@@ -1,10 +1,10 @@
 {
   "name": "@gonzih/cc-discord",
-  "version": "0.2.44",
-  "description": "Claude Code Discord bot — chat with Claude Code via Discord",
+  "version": "0.2.51",
+  "description": "Discord bot for routed Claude Code or Codex agents with ATC dispatch",
   "type": "module",
   "bin": {
-    "cc-discord": "./dist/index.js"
+    "cc-discord": "dist/index.js"
   },
   "scripts": {
     "build": "tsc && chmod +x dist/index.js",
@@ -13,7 +13,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "test:integration": "CLAUDE_BIN=./test/fixtures/mock-claude.js vitest run test/integration/"
+    "test:integration": "CLAUDE_BIN=./test/fixtures/mock-claude.js vitest run test/integration/",
+    "test:integration:codex": "CC_DISCORD_AGENT_DRIVER=codex CODEX_BIN=./test/fixtures/mock-codex.js vitest run test/integration/meta-agent.test.ts"
   },
   "files": [
     "dist/"
@@ -33,7 +34,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Gonzih/cc-discord.git"
+    "url": "git+https://github.com/Gonzih/cc-discord.git"
   },
   "homepage": "https://github.com/Gonzih/cc-discord",
   "bugs": {
@@ -42,6 +43,8 @@
   "keywords": [
     "claude",
     "claude-code",
+    "codex",
+    "atc",
     "discord",
     "bot",
     "ai"

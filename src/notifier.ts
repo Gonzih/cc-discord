@@ -4,7 +4,7 @@
  * v0.2.0 channels (discord-scoped):
  *   cca:discord:notify:{ns}              — job completion notifications → forward to Discord channel
  *   cca:chat:incoming:{ns}              — messages from the web UI → echo to Discord + feed to meta-agent
- *   cca:discord:chat:outgoing:{ns}      — meta-agent stdout lines (source=claude) → buffer+debounce → Discord
+ *   cca:discord:chat:outgoing:{ns}      — meta-agent stdout lines (source=claude/codex) → buffer+debounce → Discord
  *
  * All messages (Discord incoming, Claude responses) are also written to:
  *   cca:discord:chat:log:{ns}           — LPUSH + LTRIM 0 499 (last 500 messages)
@@ -101,7 +101,7 @@ function checkAndMarkSentSync(ns: string, raw: string): boolean {
 
 export interface ChatMessage {
   id: string;
-  source: "discord" | "ui" | "claude" | "cc-tg" | "cc-discord";
+  source: "discord" | "ui" | "claude" | "codex" | "cc-tg" | "cc-discord";
   role: "user" | "assistant" | "tool";
   content: string;
   timestamp: string;
@@ -348,18 +348,25 @@ export function startNotifier(
     }
   });
 
+  const TOOL_SLOT = "tools";
+  const RESPONSE_SLOT = "response";
+  const showToolUsage = (): boolean => /^(1|true|yes)$/i.test(process.env.CC_DISCORD_SHOW_TOOL_USAGE ?? "");
+
   /**
    * Live-stream state per namespace.
-   * One Discord message is created per namespace turn and edited in-place as Claude
-   * streams chunks. Tool activity is shown as an overlay on the same message.
-   * The message transforms: "⚙️ BashTool..." → "response ▋" → "response" (finalized).
+   * Each turn uses two stable Discord messages: a top tool log message and a
+   * bottom assistant response message. The top message is created first so
+   * later tool updates do not push the response upward.
    */
   interface LiveState {
     text: string;              // accumulated text from this turn
-    toolStatus: string;        // active tool name ("" = idle)
+    toolLog: string[];         // newest tool events first
+    activeTool: string;        // active tool name ("" = idle)
     targetChannelId: string;
-    starting: boolean;         // startOrGetLiveMessage call in flight
-    liveStarted: boolean;      // live message successfully created
+    responseStarting: boolean; // response startOrGetLiveMessage call in flight
+    responseStarted: boolean;  // response message successfully created
+    toolStarting: boolean;     // tool-log startOrGetLiveMessage call in flight
+    toolStarted: boolean;      // tool-log message successfully created
     finalTimer: ReturnType<typeof setTimeout> | null;
   }
 
@@ -368,10 +375,54 @@ export function startNotifier(
   function getLiveState(ns: string, targetChannelId: string): LiveState {
     let state = liveStates.get(ns);
     if (!state) {
-      state = { text: "", toolStatus: "", targetChannelId, starting: false, liveStarted: false, finalTimer: null };
+      state = {
+        text: "",
+        toolLog: [],
+        activeTool: "",
+        targetChannelId,
+        responseStarting: false,
+        responseStarted: false,
+        toolStarting: false,
+        toolStarted: false,
+        finalTimer: null,
+      };
       liveStates.set(ns, state);
     }
     return state;
+  }
+
+  function toolLogText(ns: string, state: LiveState, live: boolean): string {
+    const visible = state.toolLog.slice(0, 20);
+    const body = visible.length > 0 ? visible.join("\n") : "waiting for tool activity";
+    return `← [${ns}] tools\n${body}${live ? " ▋" : ""}`;
+  }
+
+  function ensureToolLogMessage(ns: string, deliverTo: string, state: LiveState): Promise<void> {
+    if (state.toolStarted) {
+      bot.updateLiveMessage(deliverTo, toolLogText(ns, state, true), TOOL_SLOT);
+      return Promise.resolve();
+    }
+    if (state.toolStarting) return Promise.resolve();
+
+    state.toolStarting = true;
+    return bot.startOrGetLiveMessage(deliverTo, toolLogText(ns, state, true), TOOL_SLOT).then((msg) => {
+      state.toolStarting = false;
+      if (msg) {
+        state.toolStarted = true;
+        bot.updateLiveMessage(deliverTo, toolLogText(ns, state, true), TOOL_SLOT);
+      }
+    }).catch(() => {
+      state.toolStarting = false;
+    });
+  }
+
+  function replaceNewestActiveTool(state: LiveState, replacement: string): void {
+    const idx = state.toolLog.findIndex((line) => line.startsWith("⚙️"));
+    if (idx >= 0) {
+      state.toolLog[idx] = replacement;
+    } else {
+      state.toolLog.unshift(replacement);
+    }
   }
 
   async function finalizeState(ns: string, state: LiveState): Promise<void> {
@@ -380,9 +431,17 @@ export function startNotifier(
     const deliverTo = bot.getLoopThreadId(state.targetChannelId) ?? state.targetChannelId;
     bot.stopMetaAgentTyping(deliverTo);
     const trimmed = state.text.trim();
-    if (!trimmed && !state.liveStarted) return;
+    const toolText = state.toolLog.length > 0 ? toolLogText(ns, state, false) : "";
+    if (showToolUsage() && (state.toolStarted || state.toolLog.length > 0)) {
+      await bot.finalizeLiveMessage(deliverTo, toolText, TOOL_SLOT);
+    }
+    if (!trimmed && !state.responseStarted) return;
     const fullText = trimmed ? `← [${ns}]\n${stripAnsi(trimmed)}` : "";
-    await bot.finalizeLiveMessage(deliverTo, fullText);
+    if (fullText.length > 0 && fullText.length < 30) {
+      await bot.finalizeLiveMessage(deliverTo, "", RESPONSE_SLOT);
+      return;
+    }
+    await bot.finalizeLiveMessage(deliverTo, fullText, RESPONSE_SLOT);
   }
 
   function scheduleFinal(ns: string, state: LiveState): void {
@@ -405,7 +464,7 @@ export function startNotifier(
       return;
     }
 
-    if (parsed?.source !== "claude") return;
+    if (parsed?.source !== "claude" && parsed?.source !== "codex") return;
 
     const targetChannelId = routedChannelIds.get(ns) ??
       (ns === namespace ? (notifyChannelId ?? getActiveChannelId?.()) : undefined);
@@ -422,24 +481,25 @@ export function startNotifier(
     // tool_start: show activity overlay, suspend finalize timer
     if (event === "tool_start") {
       const toolName = parsed.content || "tool";
-      state.toolStatus = toolName;
+      state.activeTool = toolName;
       if (state.finalTimer) { clearTimeout(state.finalTimer); state.finalTimer = null; }
-      if (state.liveStarted) {
-        const textPart = state.text.trim() ? `← [${ns}]\n${stripAnsi(state.text.trim())}\n\n` : "";
-        bot.updateLiveMessage(deliverTo, `${textPart}⚙️ \`${toolName}\`...`);
-      } else if (!state.starting) {
-        state.starting = true;
-        bot.startOrGetLiveMessage(deliverTo, `⚙️ \`${toolName}\`...`).then((msg) => {
-          state.starting = false;
-          if (msg) state.liveStarted = true;
-        }).catch(() => { state.starting = false; });
+      if (showToolUsage()) {
+        state.toolLog.unshift(`⚙️ \`${toolName}\`...`);
+        void ensureToolLogMessage(ns, deliverTo, state);
       }
       return;
     }
 
     // tool_end: clear overlay, resume finalize timer if text is pending
     if (event === "tool_end") {
-      state.toolStatus = "";
+      const toolName = state.activeTool || "tool";
+      state.activeTool = "";
+      if (showToolUsage()) {
+        replaceNewestActiveTool(state, `✓ \`${toolName}\``);
+      }
+      if (showToolUsage() && state.toolStarted) {
+        bot.updateLiveMessage(deliverTo, toolLogText(ns, state, true), TOOL_SLOT);
+      }
       if (state.text.trim()) scheduleFinal(ns, state);
       return;
     }
@@ -456,25 +516,30 @@ export function startNotifier(
     const content = parsed.content;
     if (!content) return;
 
-    state.toolStatus = ""; // text arrived — clear any tool overlay
-    state.text += (state.text ? "\n" : "") + content;
+    state.text += parsed.source === "codex"
+      ? content
+      : (state.text ? "\n" : "") + content;
     const textDisplay = `← [${ns}]\n${stripAnsi(state.text)} ▋`;
 
-    if (!state.liveStarted) {
-      if (!state.starting) {
-        state.starting = true;
-        // startOrGetLiveMessage reuses existing message if tool_start created one
-        bot.startOrGetLiveMessage(deliverTo, textDisplay).then((msg) => {
-          state.starting = false;
+    if (!state.responseStarted) {
+      if (!state.responseStarting) {
+        state.responseStarting = true;
+        const beforeResponse = showToolUsage()
+          ? ensureToolLogMessage(ns, deliverTo, state)
+          : Promise.resolve();
+        beforeResponse.then(() => {
+          return bot.startOrGetLiveMessage(deliverTo, textDisplay, RESPONSE_SLOT);
+        }).then((msg) => {
+          state.responseStarting = false;
           if (msg) {
-            state.liveStarted = true;
-            bot.updateLiveMessage(deliverTo, textDisplay);
+            state.responseStarted = true;
+            bot.updateLiveMessage(deliverTo, textDisplay, RESPONSE_SLOT);
           }
-        }).catch(() => { state.starting = false; });
+        }).catch(() => { state.responseStarting = false; });
       }
       // Text is buffered in state.text; applied when startOrGetLiveMessage resolves
     } else {
-      bot.updateLiveMessage(deliverTo, textDisplay);
+      bot.updateLiveMessage(deliverTo, textDisplay, RESPONSE_SLOT);
     }
 
     scheduleFinal(ns, state);

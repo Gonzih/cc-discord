@@ -5,7 +5,7 @@ Two bugs in src/notifier.ts:
 
 1. **Bug 1 — ⏰ echo**: cca:chat:incoming handler echoes ALL incoming messages to Discord
    via `bot.sendToChannelById(targetChannelId, '[from UI]: ${content}')`.
-   When a cron fires, cc-agent sends `⏰ cron fired: every 30m` to cca:chat:incoming,
+   When a cron fires, the scheduler sends `⏰ cron fired: every 30m` to cca:chat:incoming,
    and it leaks to Discord. The meta-agent still needs the message; only the echo must be suppressed.
 
 2. **Bug 2 — duplicate notifications**: A coordinator notification can arrive via TWO paths:

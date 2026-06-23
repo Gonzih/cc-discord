@@ -168,6 +168,19 @@ function buildMocks(loopThreadMap?: Map<string, string>) {
     stopMetaAgentTyping: vi.fn((channelId: string) => {
       stoppedTyping.push(channelId);
     }),
+    startOrGetLiveMessage: vi.fn((channelId: string, initial: string) => {
+      void channelId;
+      void initial;
+      return Promise.resolve({
+        edit: vi.fn(() => Promise.resolve()),
+        delete: vi.fn(() => Promise.resolve()),
+      });
+    }),
+    updateLiveMessage: vi.fn(),
+    finalizeLiveMessage: vi.fn((channelId: string, text: string) => {
+      if (text.trim()) sent.push({ channelId, text });
+      return Promise.resolve();
+    }),
     getLoopThreadId: vi.fn((channelId: string) => loopThreadMap?.get(channelId)),
     postEvalEmbed: vi.fn((channelId: string, report: unknown) => {
       evalEmbeds.push({ channelId, report });
@@ -290,6 +303,100 @@ describe("startNotifier — pmessage (cca:discord:chat:outgoing:*)", () => {
     await vi.advanceTimersByTimeAsync(2_000);
 
     expect(stoppedTyping).toContain("discord-ch-888");
+  });
+
+  it("appends Codex streamed deltas without inserting newlines between chunks", async () => {
+    vi.useFakeTimers();
+    const { mockBot, mockSub, mockRedis, sent } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), JSON.stringify({
+      source: "codex",
+      content: "This ",
+    }));
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), JSON.stringify({
+      source: "codex",
+      content: "should ",
+    }));
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), JSON.stringify({
+      source: "codex",
+      content: "not be line split.",
+    }));
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(sent.map((m) => m.text).join("\n")).toContain("This should not be line split.");
+    expect(sent.map((m) => m.text).join("\n")).not.toContain("This \nshould \nnot be line split.");
+  });
+
+  it("creates the tool log live message before the response live message", async () => {
+    vi.useFakeTimers();
+    process.env.CC_DISCORD_SHOW_TOOL_USAGE = "1";
+    const { mockBot, mockSub, mockRedis } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), JSON.stringify({
+      source: "codex",
+      content: "Working on it.",
+    }));
+
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+
+    expect(mockBot.startOrGetLiveMessage).toHaveBeenNthCalledWith(
+      1,
+      "primary-notify-ch",
+      expect.stringContaining("← [money-brain] tools"),
+      "tools",
+    );
+    expect(mockBot.startOrGetLiveMessage).toHaveBeenNthCalledWith(
+      2,
+      "primary-notify-ch",
+      expect.stringContaining("Working on it."),
+      "response",
+    );
+    delete process.env.CC_DISCORD_SHOW_TOOL_USAGE;
+  });
+
+  it("does not create the tool log live message by default", async () => {
+    vi.useFakeTimers();
+    delete process.env.CC_DISCORD_SHOW_TOOL_USAGE;
+    const { mockBot, mockSub, mockRedis } = buildMocks();
+
+    startNotifier(
+      mockBot as never,
+      "primary-notify-ch",
+      "money-brain",
+      mockRedis as never,
+    );
+
+    mockSub.emit("pmessage", discordChatOutgoing("*"), discordChatOutgoing("money-brain"), JSON.stringify({
+      source: "codex",
+      content: "Working on it.",
+    }));
+
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+
+    expect(mockBot.startOrGetLiveMessage).toHaveBeenCalledTimes(1);
+    expect(mockBot.startOrGetLiveMessage).toHaveBeenNthCalledWith(
+      1,
+      "primary-notify-ch",
+      expect.stringContaining("Working on it."),
+      "response",
+    );
   });
 });
 
